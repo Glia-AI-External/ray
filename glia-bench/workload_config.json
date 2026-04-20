@@ -1,0 +1,25 @@
+{
+    "synthetic": {
+        "num_rows": 320000000,
+        "num_blocks": 20000,
+        "range_offset": 0
+    },
+    "mixed_pipeline": {
+        "num_rows": 320000000,
+        "num_blocks": 20000,
+        "num_actors": 16,
+        "range_offset": 0
+    },
+    "medium_tasks": {
+        "num_rows": 2000000,
+        "num_blocks": 500,
+        "sleep_per_task": 0.05,
+        "range_offset": 0
+    },
+    "long_tasks": {
+        "num_rows": 500000,
+        "num_blocks": 50,
+        "sleep_per_task": 0.5,
+        "range_offset": 0
+    }
+}
