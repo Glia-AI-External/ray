@@ -288,6 +288,22 @@ class ResourceManager:
         if self._op_resource_allocator is not None:
             self._update_allocated_budgets()
 
+    def on_task_dispatched(self, op: "PhysicalOperator") -> None:
+        """Called by the scheduler immediately after ``op`` dispatches a task.
+
+        Incrementally decrements ``op``'s allocator budget by
+        ``op.incremental_resource_usage()``. This replaces the per-dispatch
+        full `update_usages()` walk in the scheduler's inner loop: between
+        `process_completed_tasks` boundaries (once per scheduling step),
+        the accumulated per-op decrements accurately track budget
+        consumption without the O(topology) recomputation cost. The next
+        `update_usages()` call at the top of the next scheduling step
+        re-derives exact state from the operators themselves, so any
+        drift from this approximation is bounded to a single step.
+        """
+        if self._op_resource_allocator is not None:
+            self._op_resource_allocator.on_task_dispatched(op)
+
     def _update_allocated_budgets(self):
         completed_ops_usage = self._get_completed_ops_usage()
 
@@ -650,6 +666,13 @@ class OpResourceAllocator(ABC):
         """Callback to update resource usages."""
         ...
 
+    def on_task_dispatched(self, op: PhysicalOperator) -> None:
+        """Called by the scheduler immediately after ``op`` dispatches a
+        task. Default: no-op. Allocators that track per-op budgets should
+        override to incrementally decrement them.
+        """
+        pass
+
     @abstractmethod
     def can_submit_new_task(self, op: PhysicalOperator) -> bool:
         """Return whether the given operator can submit a new task."""
@@ -913,6 +936,54 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             budget.object_store_memory
             >= (op.metrics.obj_store_mem_max_pending_output_per_task or 0)
         )
+
+    def on_task_dispatched(self, op: PhysicalOperator) -> None:
+        """Decrement ``op``'s budget by one task's incremental usage.
+
+        Called from the scheduler's inner dispatch loop after each task
+        dispatch; avoids recomputing every operator's budget via the full
+        `update_usages()` path. The decrement is clamped at zero per-field
+        so a stale budget doesn't appear negative to subsequent
+        `can_submit_new_task` checks; the next `update_usages()` call (at
+        the top of the next scheduling step) restores exact state.
+
+        The decrement covers two distinct categories of resources:
+
+        1. **Ray-core reserved resources** (CPU, GPU, memory) reported by
+           ``op.incremental_resource_usage()``. These are what Ray core
+           reserves upfront at task submission. For task ops this is
+           ``(num_cpus, num_gpus, memory)``; for actor ops it's
+           ``(0, 0, 0)`` because submitting to an existing actor reserves
+           nothing new.
+
+        2. **Predicted plasma commitment** for this task's output. This is
+           *not* a Ray-core reservation — plasma is consumed reactively as
+           the task writes its output, not reserved at dispatch — so it's
+           semantically distinct from (1) and is therefore not part of
+           ``incremental_resource_usage()``. But ``can_submit_new_task()``
+           gates dispatch on ``budget.object_store_memory >=
+           op.metrics.obj_store_mem_max_pending_output_per_task``, so this
+           dimension of the budget must also shrink per dispatch or the
+           op can over-commit plasma before the next scheduling-step
+           boundary. Estimate the commitment as the same per-task max
+           the gate uses, keeping the "decrement here" / "check there"
+           consistent.
+
+        Critically, this method constructs a new ``ExecutionResources``
+        rather than mutating ``self._op_budgets[op]`` in place —
+        ``ExecutionResources`` is treated as a value type elsewhere in the
+        codebase, and an in-place mutation here would leak to any caller
+        that happens to be holding a reference to the budget instance.
+        """
+        budget = self._op_budgets.get(op)
+        if budget is None:
+            return
+        delta = op.incremental_resource_usage().copy(
+            object_store_memory=(
+                op.metrics.obj_store_mem_max_pending_output_per_task or 0
+            )
+        )
+        self._op_budgets[op] = budget.subtract_clamp_zero(delta)
 
     def get_budget(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
         return self._op_budgets.get(op)
