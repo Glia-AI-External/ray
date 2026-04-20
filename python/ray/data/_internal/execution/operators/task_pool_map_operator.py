@@ -1,3 +1,4 @@
+import copy
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
@@ -98,6 +99,63 @@ class TaskPoolMapOperator(MapOperator):
 
         self._map_task = cached_remote_fn(_map_task, **ray_remote_static_args)
 
+        # Pre-build the `.options(...)` wrapper and derived logical-usage for
+        # the two per-bundle-size dispatch paths: small args (SPREAD) and
+        # large args (DEFAULT / locality-preferring). The per-task decision is
+        # a binary flip on `bundle.size_bytes() > large_args_threshold`, so
+        # two cached wrappers cover all dispatches. When the user provided a
+        # dynamic `ray_remote_args_fn` we cannot cache (the callback may
+        # return different args per call); in that case we fall back to the
+        # original per-task path, preserving semantics without regression.
+        self._cached_small_args, self._cached_small_options = (
+            self._build_cached_dispatch(
+                self.data_context.scheduling_strategy
+            )
+            if ray_remote_args_fn is None
+            else (None, None)
+        )
+        self._cached_large_args, self._cached_large_options = (
+            self._build_cached_dispatch(
+                self.data_context.scheduling_strategy_large_args
+            )
+            if ray_remote_args_fn is None
+            else (None, None)
+        )
+
+    def _build_cached_dispatch(
+        self, scheduling_strategy: Any
+    ) -> Tuple[Dict[str, Any], Any]:
+        """Prebuild a `(remote_args_dict, options_wrapper)` pair for one
+        dispatch path.
+
+        Mirrors the dict construction of `_get_dynamic_ray_remote_args` +
+        `_try_schedule_task`, but with the scheduling strategy fixed. Called
+        only in `__init__` when `ray_remote_args_fn` is None, so the dict
+        contents never change after construction.
+        """
+        args = copy.deepcopy(self._ray_remote_args) if self._ray_remote_args else {}
+        # max_calls isn't supported in `.options(...)`.
+        args.pop("max_calls", None)
+        # Only assign the size-aware scheduling strategy if the caller
+        # hasn't pinned one via `ray_remote_args`. Some upstream datasources
+        # (e.g. ReadParquet with local-node affinity) specify an explicit
+        # strategy that must not be overridden — clobbering it was the
+        # cause of a regression on `test_consumption::test_read_write_local_node`.
+        args.setdefault("scheduling_strategy", scheduling_strategy)
+        args["name"] = self.name
+        ctx = self.data_context
+        if (
+            "_generator_backpressure_num_objects" not in args
+            and ctx._max_num_blocks_in_streaming_gen_buffer is not None
+        ):
+            # `_generator_backpressure_num_objects` = 2 *
+            # `_max_num_blocks_in_streaming_gen_buffer` because the map task
+            # yields 2 objects per block (the block and its metadata).
+            args["_generator_backpressure_num_objects"] = (
+                2 * ctx._max_num_blocks_in_streaming_gen_buffer
+            )
+        return args, self._map_task.options(**args)
+
     def _try_schedule_task(self, bundle: RefBundle, strict: bool):
         # Notify first input for deferred initialization (e.g., Iceberg schema evolution).
         self._notify_first_input(bundle)
@@ -108,22 +166,66 @@ class TaskPoolMapOperator(MapOperator):
             target_max_block_size_override=self.target_max_block_size_override,
         )
 
-        dynamic_ray_remote_args = self._get_dynamic_ray_remote_args(input_bundle=bundle)
-        dynamic_ray_remote_args["name"] = self.name
-        logical_usage = ExecutionResources.from_resource_dict(dynamic_ray_remote_args)
-
-        if (
-            "_generator_backpressure_num_objects" not in dynamic_ray_remote_args
-            and self.data_context._max_num_blocks_in_streaming_gen_buffer is not None
-        ):
-            # The `_generator_backpressure_num_objects` parameter should be
-            # `2 * _max_num_blocks_in_streaming_gen_buffer` because we yield
-            # 2 objects for each block: the block and the block metadata.
-            dynamic_ray_remote_args["_generator_backpressure_num_objects"] = (
-                2 * self.data_context._max_num_blocks_in_streaming_gen_buffer
+        # Fast path: no dynamic remote-args callback. Use the cached
+        # (args_dict, options_wrapper) pair matching this bundle's size
+        # classification.
+        if self._cached_small_options is not None:
+            # ``self.name`` can change between ``__init__`` and the first
+            # dispatch — ``SetReadParallelismRule`` calls
+            # ``set_additional_split_factor(k)`` after plan construction,
+            # which makes ``self.name`` return e.g.
+            # ``ReadCSV->SplitBlocks(10)`` instead of ``ReadCSV``. Ray's
+            # core task metrics are keyed on the dispatch-time task name,
+            # so a stale cached name would record tasks under the wrong
+            # identifier (seen as
+            # ``test_splitblocks::test_small_file_split`` regression).
+            # Re-bake the cached args + options wrapper the first time we
+            # detect a name drift; cached thereafter.
+            if self._cached_small_args["name"] != self.name:
+                self._cached_small_args["name"] = self.name
+                self._cached_large_args["name"] = self.name
+                self._cached_small_options = self._map_task.options(
+                    **self._cached_small_args
+                )
+                self._cached_large_options = self._map_task.options(
+                    **self._cached_large_args
+                )
+            is_large = (
+                bundle.size_bytes() > self.data_context.large_args_threshold
             )
+            if is_large:
+                dynamic_ray_remote_args = self._cached_large_args
+                options_wrapper = self._cached_large_options
+            else:
+                dynamic_ray_remote_args = self._cached_small_args
+                options_wrapper = self._cached_small_options
+            # Update the metrics snapshot the first time we dispatch along
+            # this path, matching the preserved `_get_dynamic_ray_remote_args`
+            # behavior. Large args takes precedence once triggered.
+            if is_large or "scheduling_strategy" not in self._remote_args_for_metrics:
+                self._remote_args_for_metrics = dynamic_ray_remote_args
+        else:
+            # Slow path: user provided a dynamic `ray_remote_args_fn`; args
+            # may change per call, rebuild the wrapper fresh.
+            dynamic_ray_remote_args = self._get_dynamic_ray_remote_args(
+                input_bundle=bundle
+            )
+            dynamic_ray_remote_args["name"] = self.name
+            if (
+                "_generator_backpressure_num_objects" not in dynamic_ray_remote_args
+                and self.data_context._max_num_blocks_in_streaming_gen_buffer
+                is not None
+            ):
+                dynamic_ray_remote_args["_generator_backpressure_num_objects"] = (
+                    2 * self.data_context._max_num_blocks_in_streaming_gen_buffer
+                )
+            options_wrapper = self._map_task.options(**dynamic_ray_remote_args)
 
-        gen = self._map_task.options(**dynamic_ray_remote_args).remote(
+        logical_usage = ExecutionResources.from_resource_dict(
+            dynamic_ray_remote_args
+        )
+
+        gen = options_wrapper.remote(
             self._map_transformer_ref,
             self._data_context_ref,
             ctx,
