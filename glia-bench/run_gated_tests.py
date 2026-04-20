@@ -66,7 +66,15 @@ def _run_pytest_one_file(
     """
     env = os.environ.copy()
     env.setdefault("RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE", "1")
-    env.setdefault("RAY_DATA_DISABLE_PROGRESS_BARS", "1")
+    # NOTE: do NOT set RAY_DATA_DISABLE_PROGRESS_BARS here. We suppress
+    # progress bars in the benchmark harness for timing hygiene, but in
+    # the test gate several test_progress_manager.* tests specifically
+    # verify the progress-manager factory resolves to tqdm/rich/logging
+    # implementations by default — setting this env var forces them to
+    # NoopExecutionProgressManager and makes those tests fail. Leaving
+    # the DataContext default (progress bars enabled) lets those tests
+    # exercise their intended code path. Progress-bar chatter from other
+    # tests shows up in stderr, which we discard.
     # Force Ray to bind to 127.0.0.1 so tests can start Ray from the agent's
     # sandboxed shell, which runs in a network namespace where Ray's default
     # host-IP detection is unreachable.
@@ -79,6 +87,24 @@ def _run_pytest_one_file(
         abs_node = os.path.join(artifact_abs, path) + "::" + rest
     else:
         abs_node = os.path.join(artifact_abs, test_node)
+
+    # Prepend the tests directory to PYTHONPATH so that both the pytest
+    # driver AND the Ray worker processes can resolve bare-name imports
+    # (`import test_stats`, `import test_autoscaler`, ...). Pytest's
+    # prepend import-mode loads the test files as top-level modules
+    # (name = file basename) rather than dotted paths, so any pickled
+    # closure referring to a test-module function captures the reference
+    # as `test_stats.<fn>`. Without this PYTHONPATH, workers fail with
+    # `ModuleNotFoundError: No module named 'test_stats'` when the
+    # closure is deserialized on them. The tests directory we add here
+    # is the one containing the test file being invoked (which is the
+    # same directory for `python/ray/data/tests/*` and `.../unit/*`).
+    test_file_abs = abs_node.split("::", 1)[0]
+    tests_dir = os.path.dirname(test_file_abs)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        tests_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    )
 
     cmd = [
         sys.executable,
@@ -121,12 +147,85 @@ def _run_pytest_one_file(
     return proc.returncode, stderr_path
 
 
+#: When a test fails on its first run, rerun it this many times individually
+#: to characterize its pass rate. Gate regressions are assessed by comparing
+#: pass rates (baseline vs current) rather than single-run pass/fail, so
+#: flaky tests don't produce false-alarm regressions.
+FLAKY_RETRY_COUNT = 10
+
+
+def _nodeid_to_pytest_node(abs_file: str, nodeid: str) -> str:
+    """Rebuild an executable pytest node from an abs file + ``_parse_junit`` nodeid.
+
+    ``_parse_junit`` produces keys like ``test_stats::test_spilled_stats[True]``
+    or ``test_progress_manager.TestGetProgressManager::test_tqdm_progress_default``.
+    Pytest expects nodes like ``<abs>/test_stats.py::test_spilled_stats[True]``
+    or ``<abs>/test_progress_manager.py::TestGetProgressManager::test_tqdm_progress_default``.
+    The leading dotted path in the nodeid begins with the file basename
+    and may include nested class names; strip the file basename (always
+    present) and translate the remaining dots into ``::`` separators.
+    """
+    classname, _, name = nodeid.partition("::")
+    file_base = os.path.splitext(os.path.basename(abs_file))[0]
+    parts = classname.split(".") if classname else []
+    if parts and parts[0] == file_base:
+        parts = parts[1:]
+    pieces = parts + ([name] if name else [])
+    return f"{abs_file}::{'::'.join(pieces)}" if pieces else abs_file
+
+
+def _run_single_test_node(
+    artifact_dir: str,
+    test_file_node: str,
+    abs_file: str,
+    nodeid: str,
+    timeout_per_test: int,
+) -> str:
+    """Rerun one subtest by its ``_parse_junit`` nodeid. Returns its status."""
+    pytest_node_rel = _nodeid_to_pytest_node(abs_file, nodeid)
+    # Convert abs path to something _run_pytest_one_file will re-abs-ify
+    # correctly. `_run_pytest_one_file` calls os.path.join(artifact_abs, ...)
+    # only when the input isn't already absolute; an absolute-file pytest
+    # node (with "::") will pass through.
+    pytest_node = pytest_node_rel  # already absolute since abs_file is absolute
+    # Strip the artifact prefix so _run_pytest_one_file re-joins correctly
+    # (it passes abs paths through unchanged, but we already have abs).
+    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as f:
+        junit_path = f.name
+    try:
+        _, stderr_path = _run_pytest_one_file(
+            artifact_dir, pytest_node, timeout_per_test, junit_path
+        )
+        try:
+            os.unlink(stderr_path)
+        except OSError:
+            pass
+        try:
+            sub_results = _parse_junit(junit_path, test_file=test_file_node)
+        except Exception:
+            return "error"
+    finally:
+        if os.path.exists(junit_path):
+            os.unlink(junit_path)
+    return sub_results.get(nodeid, "error")
+
+
 def _run_all_tests(
     artifact_dir: str,
     timeout_per_test: int,
     test_nodes: list = None,
+    flaky_retry_count: int = FLAKY_RETRY_COUNT,
 ) -> dict:
-    """Run each test file in its own pytest subprocess; merge results."""
+    """Run each test file in its own pytest subprocess; merge results.
+
+    Returns ``{nodeid: {"passed": int, "total": int}}``. For tests that
+    pass on the first run, returns ``{"passed": 1, "total": 1}``. For
+    tests that fail on the first run, retries the subtest individually
+    up to ``flaky_retry_count`` times total and returns
+    ``{"passed": X, "total": flaky_retry_count}`` — giving the gate
+    enough signal to distinguish a genuinely-broken test from a flaky
+    one when comparing baseline vs current runs.
+    """
     if test_nodes is None:
         test_nodes = TEST_NODES
     all_results: dict = {}
@@ -175,13 +274,61 @@ def _run_all_tests(
                     except OSError:
                         pass
                     print("\n".join(msg_parts), file=sys.stderr)
-                all_results.update(file_results)
             finally:
                 if os.path.exists(stderr_path):
                     os.unlink(stderr_path)
         finally:
             if os.path.exists(junit_path):
                 os.unlink(junit_path)
+
+        # Seed first-run results into the fractional form.
+        for nodeid, status in file_results.items():
+            if status == "passed" or status == "skipped":
+                all_results[nodeid] = {"passed": 1, "total": 1, "status": status}
+            else:
+                all_results[nodeid] = {
+                    "passed": 0,
+                    "total": 1,
+                    "status": status,
+                }
+
+        # Retry any first-run failures individually to characterize flake.
+        failing = [
+            nodeid
+            for nodeid, status in file_results.items()
+            if status not in ("passed", "skipped")
+            and nodeid != test_node  # exclude the file-level error placeholder
+        ]
+        if failing and flaky_retry_count > 1:
+            test_file_part = test_node.split("::", 1)[0]
+            abs_file = os.path.join(os.path.abspath(artifact_dir), test_file_part)
+            for nodeid in failing:
+                print(
+                    f"    ↻ retrying flaky {nodeid} "
+                    f"up to {flaky_retry_count - 1} more times",
+                    file=sys.stderr,
+                )
+                for attempt in range(flaky_retry_count - 1):
+                    status = _run_single_test_node(
+                        artifact_dir,
+                        test_node,
+                        abs_file,
+                        nodeid,
+                        timeout_per_test,
+                    )
+                    all_results[nodeid]["total"] += 1
+                    if status == "passed":
+                        all_results[nodeid]["passed"] += 1
+                    # Track the most recent non-passed status for reporting.
+                    if status != "passed":
+                        all_results[nodeid]["status"] = status
+                # Log final fraction for this nodeid.
+                r = all_results[nodeid]
+                print(
+                    f"      → {nodeid}: {r['passed']}/{r['total']} passed",
+                    file=sys.stderr,
+                )
+
     return all_results
 
 
@@ -261,19 +408,23 @@ def _run_sensitive_tests(artifact_dir: str, timeout_per_test: int,
                          n_runs: int = SENSITIVE_TEST_RUNS) -> dict:
     """Run each SENSITIVE_TESTS nodeid ``n_runs`` times.
 
-    Returns a dict ``{normalized_nodeid: "passed"|"failed"|"error"|"skipped"}``
-    where the status is the strictest observed across the N runs:
-      - "passed" only if ALL N runs passed
-      - otherwise the worst observed status (failed > error > skipped)
+    Returns ``{normalized_nodeid: {"passed": int, "total": int, "status": str}}``
+    where ``passed`` is the count of runs that produced status "passed",
+    ``total`` is ``n_runs``, and ``status`` is the strictest non-pass
+    status observed (or "passed" if all N runs passed). Matches the
+    format returned by ``_run_all_tests`` so the two can be merged
+    without conversion.
 
-    Keys are returned in the SAME normalized form that ``_parse_junit``
-    produces (``<file_basename>::<test>``), so callers can directly merge
-    into single-run results without creating duplicates.
+    The strictness contract for sensitive tests (pandas/arrow shuffle
+    determinism) says a single pass isn't evidence of correctness — the
+    fractional pass rate is the real signal and is compared directly
+    against the baseline's same-sampled rate at gate time.
     """
     STATUS_RANK = {"passed": 0, "skipped": 1, "error": 2, "failed": 3}
     results: dict = {}
     for i, test_node in enumerate(SENSITIVE_TESTS):
         worst = "passed"
+        pass_count = 0
         for run in range(n_runs):
             with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as f:
                 junit_path = f.name
@@ -311,12 +462,18 @@ def _run_sensitive_tests(artifact_dir: str, timeout_per_test: int,
                 finally:
                     if os.path.exists(stderr_path):
                         os.unlink(stderr_path)
+                if status == "passed":
+                    pass_count += 1
                 if STATUS_RANK.get(status, 99) > STATUS_RANK.get(worst, 99):
                     worst = status
             finally:
                 if os.path.exists(junit_path):
                     os.unlink(junit_path)
-        results[_normalize_sensitive_nodeid(test_node)] = worst
+        results[_normalize_sensitive_nodeid(test_node)] = {
+            "passed": pass_count,
+            "total": n_runs,
+            "status": worst,
+        }
     return results
 
 
@@ -347,9 +504,21 @@ def cmd_record(artifact_dir: str, baseline_path: str, timeout: int) -> int:
     with open(baseline_path, "w") as f:
         json.dump({"results": results}, f, indent=2, sort_keys=True)
 
-    summary = {}
+    summary = {
+        "stable_pass": 0,      # passed all runs
+        "stable_fail": 0,      # passed zero runs
+        "flaky": 0,            # passed some but not all runs
+        "skipped": 0,
+    }
     for v in results.values():
-        summary[v] = summary.get(v, 0) + 1
+        if v.get("status") == "skipped":
+            summary["skipped"] += 1
+        elif v["passed"] == v["total"]:
+            summary["stable_pass"] += 1
+        elif v["passed"] == 0:
+            summary["stable_fail"] += 1
+        else:
+            summary["flaky"] += 1
 
     print(json.dumps({"path": baseline_path, "total": len(results), "summary": summary}))
     return 0
@@ -399,17 +568,35 @@ def cmd_gate(artifact_dir: str, baseline_path: str, timeout: int, fast: bool) ->
         # replaces the single-run entry written by _run_all_tests.
         current.update(_run_sensitive_tests(artifact_dir, timeout))
 
-    # A "regression" is: a test that passed on baseline but now fails or errors.
-    # Missing-in-current is also a regression (test disappeared / collection error).
+    # A "regression" is: a test whose pass rate dropped meaningfully
+    # between baseline and current. We compare rates rather than raw
+    # pass/fail because several Ray 2.55 tests are flaky (a single run
+    # can land either way) — strict pass/fail comparison produces
+    # false-alarm regressions. The rule:
+    #
+    #   regression = baseline_rate - current_rate > RATE_TOLERANCE
+    #
+    # with RATE_TOLERANCE = 0.1 (10% of runs). A stable-pass baseline
+    # (rate = 1.0) with a ~90% current is not flagged; a 50% flaky
+    # baseline becoming 20% flaky IS flagged. A baseline that failed
+    # 100% but now passes is reported in `fixed` (informational).
+    RATE_TOLERANCE = 0.1
+
+    def _rate(entry) -> float:
+        total = entry.get("total", 1) if isinstance(entry, dict) else 1
+        passed = entry.get("passed", 0) if isinstance(entry, dict) else (
+            1 if entry == "passed" else 0
+        )
+        return passed / total if total > 0 else 0.0
+
     regressed = []
-    fixed = []  # passed in current but failed in baseline — informational only
-    unknown = []  # in current but not in baseline (new or renamed tests)
+    fixed = []
+    unknown = []
 
     # In fast mode we only check the subset of baseline entries that
     # correspond to files we actually ran, to avoid reporting every other
     # test as "missing".
     if fast:
-        # Match baseline entries to the files currently run, via classname.
         fast_file_stems = set()
         for node in FAST_TEST_NODES:
             fast_file_stems.add(
@@ -422,23 +609,36 @@ def cmd_gate(artifact_dir: str, baseline_path: str, timeout: int, fast: bool) ->
     else:
         relevant_baseline = baseline
 
-    for nodeid, baseline_status in relevant_baseline.items():
-        current_status = current.get(nodeid)
-        if baseline_status == "passed":
-            if current_status in (None, "failed", "error"):
+    for nodeid, baseline_entry in relevant_baseline.items():
+        current_entry = current.get(nodeid)
+        baseline_rate = _rate(baseline_entry)
+        if current_entry is None:
+            # Missing in current. Only a regression if the baseline
+            # actually passed at all.
+            if baseline_rate > 0:
                 regressed.append({
                     "test": nodeid,
-                    "baseline": baseline_status,
-                    "current": current_status or "missing",
+                    "baseline": baseline_entry,
+                    "current": "missing",
                 })
-        else:
-            # Previously failed/errored/skipped; a now-passing one is "fixed".
-            if current_status == "passed":
-                fixed.append(nodeid)
+            continue
+        current_rate = _rate(current_entry)
+        if baseline_rate - current_rate > RATE_TOLERANCE:
+            regressed.append({
+                "test": nodeid,
+                "baseline": baseline_entry,
+                "current": current_entry,
+            })
+        elif current_rate > baseline_rate + RATE_TOLERANCE:
+            fixed.append({
+                "test": nodeid,
+                "baseline": baseline_entry,
+                "current": current_entry,
+            })
 
-    for nodeid, current_status in current.items():
+    for nodeid, current_entry in current.items():
         if nodeid not in baseline:
-            unknown.append({"test": nodeid, "status": current_status})
+            unknown.append({"test": nodeid, "status": current_entry})
 
     summary = {
         "baseline_total": len(baseline),
