@@ -1201,6 +1201,103 @@ class TestReservationOpResourceAllocator:
         )
 
 
+def test_on_task_dispatched_decrements_budget_without_mutation(restore_data_context):
+    """`ReservationOpResourceAllocator.on_task_dispatched(op)` decrements
+    that op's budget by one task's ``incremental_resource_usage()`` and
+    clamps at zero, producing a *new* ExecutionResources — never mutating
+    the previous instance in place. The "no in-place mutation" guarantee
+    matters because ExecutionResources is treated as a value type
+    elsewhere; mutating the cached budget would leak to any caller
+    holding a prior reference.
+    """
+    # Minimal 2-op pipeline: InputDataBuffer -> Map.
+    input_op = InputDataBuffer(DataContext.get_current(), MagicMock())
+    op2 = mock_map_op(input_op=input_op, ray_remote_args={"num_cpus": 2})
+    # Override op2's incremental_resource_usage to exercise a multi-cpu path.
+    op2.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=2, gpu=0)
+    )
+
+    topo = build_streaming_topology(op2, ExecutionOptions())
+    rm = ResourceManager(
+        topo,
+        ExecutionOptions(),
+        MagicMock(return_value=ExecutionResources(cpu=8, gpu=0)),
+        DataContext.get_current(),
+    )
+    rm.update_usages()
+    alloc = rm._op_resource_allocator
+    assert isinstance(alloc, ReservationOpResourceAllocator)
+
+    before_budget = alloc.get_budget(op2)
+    assert before_budget is not None
+    before_snapshot = (
+        before_budget.cpu,
+        before_budget.gpu,
+        before_budget.object_store_memory,
+        before_budget.memory,
+    )
+
+    rm.on_task_dispatched(op2)
+
+    after_budget = alloc.get_budget(op2)
+    assert after_budget is not before_budget  # new object, not in-place
+    assert after_budget.cpu == max(before_snapshot[0] - 2.0, 0.0)
+    # Prior budget object unchanged.
+    assert (
+        before_budget.cpu,
+        before_budget.gpu,
+        before_budget.object_store_memory,
+        before_budget.memory,
+    ) == before_snapshot
+
+
+def test_on_task_dispatched_clamps_at_zero_never_negative(restore_data_context):
+    """`on_task_dispatched` clamps each resource field at zero — a stale
+    budget + an oversized ``incremental_resource_usage()`` never produces
+    a negative budget that would confuse downstream schedulability
+    checks.
+    """
+    input_op = InputDataBuffer(DataContext.get_current(), MagicMock())
+    op2 = mock_map_op(input_op=input_op, ray_remote_args={"num_cpus": 1})
+    op2.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=1000, gpu=0)
+    )
+
+    topo = build_streaming_topology(op2, ExecutionOptions())
+    rm = ResourceManager(
+        topo,
+        ExecutionOptions(),
+        MagicMock(return_value=ExecutionResources(cpu=8, gpu=0)),
+        DataContext.get_current(),
+    )
+    rm.update_usages()
+    rm.on_task_dispatched(op2)
+    alloc = rm._op_resource_allocator
+    budget = alloc.get_budget(op2)
+    assert budget is not None
+    assert budget.cpu == 0.0
+    assert budget.gpu == 0.0
+    assert budget.object_store_memory == 0.0
+    assert budget.memory == 0.0
+
+
+def test_execution_resources_subtract_clamp_zero():
+    """ExecutionResources.subtract_clamp_zero equals
+    subtract(...).max(zero()) but produces one intermediate object
+    instead of two — hot-path shorthand for incremental-budget decrement.
+    """
+    a = ExecutionResources(cpu=4.0, gpu=1.0, object_store_memory=100, memory=200)
+    b = ExecutionResources(cpu=10.0, gpu=0.5, object_store_memory=30, memory=400)
+
+    fused = a.subtract_clamp_zero(b)
+    naive = a.subtract(b).max(ExecutionResources.zero())
+    assert fused.cpu == naive.cpu == 0.0  # 4 - 10 clamped
+    assert fused.gpu == naive.gpu == 0.5
+    assert fused.object_store_memory == naive.object_store_memory == 70
+    assert fused.memory == naive.memory == 0.0  # 200 - 400 clamped
+
+
 if __name__ == "__main__":
     import sys
 
