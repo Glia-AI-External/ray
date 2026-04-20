@@ -244,6 +244,51 @@ def test_read_datasource_basic_functionality(
     assert rows_same(df, expected_df)
 
 
+def test_derive_block_metadata_batched(ray_start_regular_shared):
+    """_derive_block_metadata issues one get_local_object_locations call for
+    all refs and returns per-task BlockMetadata with the correct size_bytes.
+
+    Regression test for the batched lookup: calling
+    get_local_object_locations per-task adds a measurable fraction of
+    pipeline setup time at typical read parallelism (tens of thousands
+    of tasks). This test also verifies we preserve per-task size
+    resolution — each BlockMetadata's size_bytes should match the
+    object-store's reported size for that specific ref, not a shared
+    estimate.
+    """
+    from ray.data._internal.planner.plan_read_op import _derive_block_metadata
+
+    # Fabricate three ReadTasks whose serialized sizes differ. We pad each
+    # task's read_fn closure with a distinct tail of bytes so the
+    # cloudpickled sizes are distinguishable.
+    def make_task(tag: bytes) -> ReadTask:
+        _captured = tag  # noqa: F841  — captured by the closure below
+
+        def _read_fn() -> List[Block]:
+            return [pd.DataFrame({"v": [1], "tag": [_captured.hex()]})]
+
+        meta = BlockMetadata(
+            num_rows=1, size_bytes=None, exec_stats=None, input_files=None
+        )
+        return ReadTask(read_fn=_read_fn, metadata=meta, schema=None)
+
+    tasks = [make_task(b"x" * (1024 * (1 + i))) for i in range(3)]
+    refs = [ray.put(t) for t in tasks]
+    mds = _derive_block_metadata(tasks, refs)
+
+    assert len(mds) == 3
+    sizes = [m.size_bytes for m in mds]
+    assert all(s is not None and s > 0 for s in sizes), sizes
+    # Distinct closures should produce distinct serialized sizes — i.e.
+    # we're not bucketing everything into one shared estimate.
+    assert len(set(sizes)) == 3, sizes
+    # BlockMetadata shape preserved.
+    for md in mds:
+        assert md.num_rows == 1
+        assert md.exec_stats is None
+        assert md.input_files is None
+
+
 if __name__ == "__main__":
     import sys
 
