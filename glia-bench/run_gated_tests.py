@@ -6,9 +6,9 @@ Two modes:
   --mode record   Run all tests against the current artifact source (which
                   must be unmodified vanilla Ray at this point, since this
                   is called from ``setup_environment.sh``). Record each
-                  test's pass/fail into baseline/tests_baseline.json. Tests
-                  that fail here are considered "pre-existing failures" and
-                  are ignored by the gate.
+                  test's pass/fail into results/optimization_gate_baseline.json.
+                  Tests that fail here are considered "pre-existing failures"
+                  and are ignored by the gate.
 
   --mode gate     Run the same tests against the artifact's (possibly
                   modified) Ray source and compare against baseline. Prints
@@ -25,8 +25,10 @@ and parsing it.
 """
 
 import argparse
+import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,8 +38,7 @@ from xml.etree import ElementTree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_list import (  # noqa: E402
     FAST_TEST_NODES,
-    SENSITIVE_TEST_RUNS,
-    SENSITIVE_TESTS,
+    KNOWN_FLAKY_TESTS,
     TEST_NODES,
 )
 
@@ -130,6 +131,27 @@ def _run_pytest_one_file(
     stderr_fd, stderr_path = tempfile.mkstemp(
         prefix="gated-tests-stderr-", suffix=".log"
     )
+    # Clean up any stale Ray sessions before each pytest run. Each
+    # ``ray.init()`` creates a ``/tmp/ray/session_*`` directory containing the
+    # cluster's GCS address; accumulated sessions confuse Ray's
+    # ``canonicalize_bootstrap_address_or_die`` auto-discovery (tests that
+    # call ``ray.util.state.*`` raise
+    # "Found multiple active Ray instances" and fail). Clearing these between
+    # files keeps each pytest subprocess's Ray state isolated. Also unset
+    # ``RAY_ADDRESS`` so the test's own ``ray.init()`` picks its own address
+    # rather than trying to connect to a prior cluster.
+    for session_dir in glob.glob("/tmp/ray/session_*"):
+        try:
+            shutil.rmtree(session_dir, ignore_errors=True)
+        except OSError:
+            pass
+    session_latest = "/tmp/ray/session_latest"
+    if os.path.islink(session_latest) or os.path.exists(session_latest):
+        try:
+            os.unlink(session_latest)
+        except OSError:
+            pass
+    env.pop("RAY_ADDRESS", None)
     try:
         with open(os.devnull, "w") as devnull, os.fdopen(stderr_fd, "w") as stderr_f:
             proc = subprocess.run(
@@ -144,6 +166,21 @@ def _run_pytest_one_file(
             os.rmdir(clean_cwd)
         except OSError:
             pass
+        # After pytest exits, ``ray.init()``-spawned daemons (gcs_server,
+        # raylet, dashboard, ray::* workers) sometimes orphan and keep
+        # running — ``ray.shutdown()`` during fixture teardown doesn't
+        # always reap them, especially on pytest-timeout SIGKILLs. Left
+        # alone, they accumulate and cause Ray's auto-discovery to find
+        # "multiple active Ray instances" on subsequent tests that call
+        # ``ray.util.state.*``. Reap them here so each test file starts
+        # clean.
+        # pkill's -f uses ERE; alternation must be bare ``|`` (not ``\|``).
+        subprocess.run(
+            ["pkill", "-9", "-f",
+             "gcs_server|raylet|ray::|ray/dashboard/agent.py|ray/dashboard/dashboard.py|runtime_env/agent/main.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     return proc.returncode, stderr_path
 
 
@@ -292,19 +329,36 @@ def _run_all_tests(
                     "status": status,
                 }
 
-        # Retry any first-run failures individually to characterize flake.
-        failing = [
+        # Retry any first-run failures individually to characterize flake,
+        # AND always retry any KNOWN_FLAKY_TESTS regardless of first-run
+        # outcome. The latter keeps the baseline-vs-gate comparison
+        # symmetric on tests whose natural pass-rate is <100%; without
+        # it, a single-run pass on the baseline against a 10-run-retry on
+        # the gate is a retry-policy artifact, not a real regression.
+        retry_nodes = [
             nodeid
             for nodeid, status in file_results.items()
-            if status not in ("passed", "skipped")
-            and nodeid != test_node  # exclude the file-level error placeholder
+            if nodeid != test_node  # exclude the file-level error placeholder
+            and (
+                status not in ("passed", "skipped")
+                or nodeid in KNOWN_FLAKY_TESTS
+            )
         ]
-        if failing and flaky_retry_count > 1:
+        if retry_nodes and flaky_retry_count > 1:
             test_file_part = test_node.split("::", 1)[0]
             abs_file = os.path.join(os.path.abspath(artifact_dir), test_file_part)
-            for nodeid in failing:
+            for nodeid in retry_nodes:
+                known = nodeid in KNOWN_FLAKY_TESTS
+                first_pass = file_results[nodeid] == "passed"
+                reason = (
+                    "known-flaky (retrying despite first-run pass)"
+                    if known and first_pass
+                    else "known-flaky"
+                    if known
+                    else "flaky"
+                )
                 print(
-                    f"    ↻ retrying flaky {nodeid} "
+                    f"    ↻ retrying {reason} {nodeid} "
                     f"up to {flaky_retry_count - 1} more times",
                     file=sys.stderr,
                 )
@@ -393,90 +447,6 @@ def _parse_junit(junit_path: str, test_file: str = "") -> dict:
     return results
 
 
-def _normalize_sensitive_nodeid(test_node: str) -> str:
-    """Convert a SENSITIVE_TESTS path-based nodeid to the normalized form
-    used by ``_parse_junit`` (``<file_basename>::<test_part>``), so that
-    sensitive-test entries in baseline and gate results match the keys
-    produced by normal runs and don't duplicate them.
-    """
-    file_part, _, test_part = test_node.partition("::")
-    basename = os.path.splitext(os.path.basename(file_part))[0]
-    return f"{basename}::{test_part}" if test_part else basename
-
-
-def _run_sensitive_tests(artifact_dir: str, timeout_per_test: int,
-                         n_runs: int = SENSITIVE_TEST_RUNS) -> dict:
-    """Run each SENSITIVE_TESTS nodeid ``n_runs`` times.
-
-    Returns ``{normalized_nodeid: {"passed": int, "total": int, "status": str}}``
-    where ``passed`` is the count of runs that produced status "passed",
-    ``total`` is ``n_runs``, and ``status`` is the strictest non-pass
-    status observed (or "passed" if all N runs passed). Matches the
-    format returned by ``_run_all_tests`` so the two can be merged
-    without conversion.
-
-    The strictness contract for sensitive tests (pandas/arrow shuffle
-    determinism) says a single pass isn't evidence of correctness — the
-    fractional pass rate is the real signal and is compared directly
-    against the baseline's same-sampled rate at gate time.
-    """
-    STATUS_RANK = {"passed": 0, "skipped": 1, "error": 2, "failed": 3}
-    results: dict = {}
-    for i, test_node in enumerate(SENSITIVE_TESTS):
-        worst = "passed"
-        pass_count = 0
-        for run in range(n_runs):
-            with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as f:
-                junit_path = f.name
-            try:
-                print(
-                    f"  [sensitive {i+1}/{len(SENSITIVE_TESTS)}] {test_node} "
-                    f"run {run+1}/{n_runs}",
-                    file=sys.stderr,
-                )
-                _, stderr_path = _run_pytest_one_file(
-                    artifact_dir, test_node, timeout_per_test, junit_path
-                )
-                try:
-                    parsed = _parse_junit(junit_path, test_file=test_node)
-                    # For a nodeid-specific invocation, expect exactly one
-                    # result. Take the single entry's status.
-                    if parsed:
-                        status = next(iter(parsed.values()))
-                    else:
-                        status = "error"
-                        try:
-                            with open(stderr_path) as sf:
-                                tail = sf.read()[-2000:]
-                            if tail.strip():
-                                print(
-                                    f"    ! sensitive test produced no result; "
-                                    f"pytest stderr tail:\n"
-                                    + "\n".join(
-                                        "      " + ln for ln in tail.splitlines()[-20:]
-                                    ),
-                                    file=sys.stderr,
-                                )
-                        except OSError:
-                            pass
-                finally:
-                    if os.path.exists(stderr_path):
-                        os.unlink(stderr_path)
-                if status == "passed":
-                    pass_count += 1
-                if STATUS_RANK.get(status, 99) > STATUS_RANK.get(worst, 99):
-                    worst = status
-            finally:
-                if os.path.exists(junit_path):
-                    os.unlink(junit_path)
-        results[_normalize_sensitive_nodeid(test_node)] = {
-            "passed": pass_count,
-            "total": n_runs,
-            "status": worst,
-        }
-    return results
-
-
 def cmd_record(artifact_dir: str, baseline_path: str, timeout: int) -> int:
     """Run tests against the artifact source at the time of setup, record
     pass/fail. Must be called before any agent modifications.
@@ -484,21 +454,13 @@ def cmd_record(artifact_dir: str, baseline_path: str, timeout: int) -> int:
     Always records the full TEST_NODES list; the fast subset is a strict
     subset so no separate fast-mode baseline is needed.
 
-    SENSITIVE_TESTS are additionally re-run N times; their baseline status is
-    the strictest observed across the N runs. This prevents a single lucky
-    pass at record time from baselining a determinism-sensitive test as
-    "passed" when it only passes probabilistically.
+    Tests in ``KNOWN_FLAKY_TESTS`` are run at full retry depth
+    (``FLAKY_RETRY_COUNT`` = 10) regardless of first-run outcome, so the
+    recorded baseline pass-rate is the true rate rather than a single-run
+    sample. This keeps the baseline-vs-gate comparison symmetric on
+    tests whose natural pass-rate is <100%.
     """
     results = _run_all_tests(artifact_dir, timeout_per_test=timeout)
-
-    # Override sensitive-test results with multi-run aggregation.
-    print(
-        f"  [sensitive] running {len(SENSITIVE_TESTS)} sensitive test(s) "
-        f"{SENSITIVE_TEST_RUNS}x each for baseline",
-        file=sys.stderr,
-    )
-    sensitive_results = _run_sensitive_tests(artifact_dir, timeout)
-    results.update(sensitive_results)
 
     os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
     with open(baseline_path, "w") as f:
@@ -545,28 +507,6 @@ def cmd_gate(artifact_dir: str, baseline_path: str, timeout: int, fast: bool) ->
     current = _run_all_tests(
         artifact_dir, timeout_per_test=timeout, test_nodes=test_nodes
     )
-
-    # For sensitive tests (determinism-class contracts), override the
-    # single-shot result with an N-run aggregation. A single pass is not
-    # evidence of correctness for probabilistic bugs. The strictest observed
-    # status across N runs is used.
-    sensitive_in_scope = [
-        t for t in SENSITIVE_TESTS
-        if any(
-            os.path.splitext(os.path.basename(t.split("::")[0]))[0]
-            in os.path.splitext(os.path.basename(n.split("::")[0]))[0]
-            for n in test_nodes
-        )
-    ]
-    if sensitive_in_scope:
-        print(
-            f"  [sensitive] re-running {len(sensitive_in_scope)} sensitive test(s) "
-            f"{SENSITIVE_TEST_RUNS}x each",
-            file=sys.stderr,
-        )
-        # _run_sensitive_tests returns normalized keys, so a plain update
-        # replaces the single-run entry written by _run_all_tests.
-        current.update(_run_sensitive_tests(artifact_dir, timeout))
 
     # A "regression" is: a test whose pass rate dropped meaningfully
     # between baseline and current. We compare rates rather than raw
@@ -674,7 +614,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--baseline",
-        default="baseline/tests_baseline.json",
+        default="glia-bench/results/optimization_gate_baseline.json",
         help="Path to the baseline JSON (relative to artifact-dir or absolute).",
     )
     parser.add_argument(
