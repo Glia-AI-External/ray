@@ -63,35 +63,25 @@ FAST_TEST_NODES = [
 ]
 
 
-# Tests that encode user-facing determinism contracts and are therefore
-# SENSITIVE to non-deterministic scheduling changes. They are NOT flaky in the
-# usual sense — they encode real contracts Ray Data advertises, and they will
-# pass reliably against a scheduler that keeps block arrival order
-# deterministic. They fail probabilistically under timing-sensitive
-# optimizations (e.g. aggressive ray.wait timeout reductions, partial
-# completion sets).
+# Tests that either (a) flake probabilistically on this hardware due to
+# timing sensitivity that is not under Ray Data's control (e.g.
+# ``test_spilled_stats`` asserts on a backpressure-time string that depends on
+# per-host timing precision), or (b) encode user-facing determinism contracts
+# whose failure mode is probabilistic rather than deterministic (shuffle
+# determinism). Both classes must be retried at full depth on BOTH the
+# baseline and the gate so that the comparison is symmetric; a single-run
+# pass on the baseline against a 10-run-retry on the gate is a
+# retry-policy artifact, not a real regression.
 #
-# Run these tests multiple times in both baseline-record and gate modes. A
-# single pass is not evidence of correctness — probabilistic bugs pass a
-# non-trivial fraction of runs. Requiring N consecutive passes is the only way
-# to distinguish a deterministic success from a lucky probabilistic one.
-#
-# Baseline: if any of N runs fails, the test is recorded as "failed" in
-# baseline (treated as pre-existing and ignored).
-# Gate: if any of N runs fails, the gate reports the test as regressed.
-#
-# Agents can pre-check with ``./evaluator/run_sensitive_tests [N]`` which runs
-# the same list directly.
-SENSITIVE_TESTS = [
-    "python/ray/data/tests/test_dataset_iter.py::test_iter_batches_local_shuffle[pandas]",
-    "python/ray/data/tests/test_dataset_iter.py::test_iter_batches_local_shuffle[arrow]",
-]
-
-# Default number of runs for sensitive tests. Chosen empirically: for a bug
-# with ~50% per-run pass rate, 3 runs give ~12.5% probability of passing by
-# luck. Combined with the gate's inability to retry without a fresh commit,
-# slip-through becomes very unlikely.
-SENSITIVE_TEST_RUNS = 3
+# Normalized nodeid form: ``<test_file_basename_without_ext>::<function_name>``
+# (matches the ``_parse_junit`` output).
+KNOWN_FLAKY_TESTS = {
+    "test_stats::test_spilled_stats[True]",
+    "test_stats::test_spilled_stats[False]",
+    "test_consumption::test_read_write_local_node_ray_client",
+    "test_dataset_iter::test_iter_batches_local_shuffle[pandas]",
+    "test_dataset_iter::test_iter_batches_local_shuffle[arrow]",
+}
 
 
 TEST_NODES = [
