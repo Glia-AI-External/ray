@@ -118,6 +118,12 @@ TEST_NODES = [
     "python/ray/data/tests/test_map_operator.py",
     "python/ray/data/tests/test_limit_operator.py",
     "python/ray/data/tests/test_actor_pool_map_operator.py",
+    # test_splitblocks catches a subtle M3 (cached dispatch options) regression
+    # where the cached `options(name=...)` captures the operator name before
+    # SetReadParallelismRule renames the op to `Read*->SplitBlocks(k)`. Without
+    # this file in the gate the stale-name bug surfaces only as a Ray core
+    # task-metric miscount inside SplitBlocks' assertions.
+    "python/ray/data/tests/test_splitblocks.py",
 
     # === Dataset-level e2e (indirect coverage) ===
     "python/ray/data/tests/test_consumption.py",
