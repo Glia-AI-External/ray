@@ -6,12 +6,14 @@
 # no compiled binaries.
 #
 # Artifact source is found in this order:
-#   1. ``<site-packages>/ray/`` (present if ``pip install ray==2.55.0``
-#      was run and the editable install hasn't uninstalled it yet).
-#   2. A cached wheel extraction at ``$RAY_WHEEL_CACHE`` (default
+#   1. A cached wheel extraction at ``$RAY_WHEEL_CACHE`` (default
 #      ``$HOME/.cache/glia-bench/ray-2.55.0``).
-#   3. Download the wheel via ``pip download ray==2.55.0`` and extract it
+#   2. Download the wheel via ``pip download ray==2.55.0`` and extract it
 #      into the cache.
+#
+# Cache is preferred over ``<site-packages>/ray/`` so that the symlinks are
+# stable across ``pip install -e python/`` (which uninstalls the wheel and
+# would otherwise turn every symlink into a dangling pointer).
 #
 # Run this once per source tree you intend to benchmark (typically both
 # the pristine ray-2.55.0 tree and this fork's M6 tree).
@@ -50,19 +52,12 @@ download_wheel() {
 }
 
 find_source() {
-    # 1. Wheel installed into site-packages.
-    local site
-    site="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-    if [ -f "$site/ray/_raylet.so" ]; then
-        echo "$site/ray"
-        return
-    fi
-    # 2. Cached extraction.
+    # 1. Cached extraction (stable across `pip install -e python/`).
     if [ -f "$CACHE_DIR/ray/_raylet.so" ]; then
         echo "$CACHE_DIR/ray"
         return
     fi
-    # 3. Download + extract, then use the cache.
+    # 2. Download + extract into the cache.
     download_wheel
     if [ -f "$CACHE_DIR/ray/_raylet.so" ]; then
         echo "$CACHE_DIR/ray"
@@ -86,6 +81,7 @@ echo "source: $SRC"
 DIR_ARTIFACTS=(
     _raylet.so
     core/generated
+    serve/generated
     cpp
     thirdparty_files
     dashboard/client/build
