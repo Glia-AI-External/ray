@@ -947,6 +947,28 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         `can_submit_new_task` checks; the next `update_usages()` call (at
         the top of the next scheduling step) restores exact state.
 
+        The decrement covers two distinct categories of resources:
+
+        1. **Ray-core reserved resources** (CPU, GPU, memory) reported by
+           ``op.incremental_resource_usage()``. These are what Ray core
+           reserves upfront at task submission. For task ops this is
+           ``(num_cpus, num_gpus, memory)``; for actor ops it's
+           ``(0, 0, 0)`` because submitting to an existing actor reserves
+           nothing new.
+
+        2. **Predicted plasma commitment** for this task's output. This is
+           *not* a Ray-core reservation — plasma is consumed reactively as
+           the task writes its output, not reserved at dispatch — so it's
+           semantically distinct from (1) and is therefore not part of
+           ``incremental_resource_usage()``. But ``can_submit_new_task()``
+           gates dispatch on ``budget.object_store_memory >=
+           op.metrics.obj_store_mem_max_pending_output_per_task``, so this
+           dimension of the budget must also shrink per dispatch or the
+           op can over-commit plasma before the next scheduling-step
+           boundary. Estimate the commitment as the same per-task max
+           the gate uses, keeping the "decrement here" / "check there"
+           consistent.
+
         Critically, this method constructs a new ``ExecutionResources``
         rather than mutating ``self._op_budgets[op]`` in place —
         ``ExecutionResources`` is treated as a value type elsewhere in the
@@ -956,9 +978,12 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
         budget = self._op_budgets.get(op)
         if budget is None:
             return
-        self._op_budgets[op] = budget.subtract_clamp_zero(
-            op.incremental_resource_usage()
+        delta = op.incremental_resource_usage().copy(
+            object_store_memory=(
+                op.metrics.obj_store_mem_max_pending_output_per_task or 0
+            )
         )
+        self._op_budgets[op] = budget.subtract_clamp_zero(delta)
 
     def get_budget(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
         return self._op_budgets.get(op)
