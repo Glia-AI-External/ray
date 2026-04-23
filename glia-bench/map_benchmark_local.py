@@ -62,7 +62,8 @@ def main(sleep_ms: int,
          batch_size: int,
          object_store_gb: float = 0.0,
          per_actor_model_bytes: int = 0,
-         output_padding_bytes: int = 0) -> dict:
+         output_padding_bytes: int = 0,
+         num_cpus: int = 0) -> dict:
     import ray
     import ray.data
 
@@ -81,6 +82,12 @@ def main(sleep_ms: int,
         # backpressure — this is the regime the reviewer saw on his 100-node
         # cluster (481 GiB / 448 GiB object store, sustained spilling).
         init_kwargs["object_store_memory"] = int(object_store_gb * 1024**3)
+    if num_cpus > 0:
+        # Clamp the effective cluster CPU count below what the host actually
+        # has. This forces the actor pool's autoscaler to cap out below its
+        # max_concurrency and matches the reviewer's regime where actor +
+        # task CPU demand exceeded cluster CPU capacity (1706/800).
+        init_kwargs["num_cpus"] = num_cpus
     ray.init(ignore_reinit_error=True, **init_kwargs)
 
     # Shared model (matches map_benchmark.py semantics) unless the caller
@@ -211,6 +218,12 @@ if __name__ == "__main__":
                          "column of this many KB per row. Inflates in-flight "
                          "output data so pending-output plasma pressure "
                          "builds up during the run.")
+    ap.add_argument("--num-cpus", type=int, default=0,
+                    help="If > 0, clamps the Ray cluster's effective CPU "
+                         "count. Use to force the actor pool's autoscaler "
+                         "to cap out below max_concurrency and to force "
+                         "CPU over-subscription matching the reviewer's "
+                         "regime (1706 CPU demand / 800 cluster CPU).")
     args = ap.parse_args()
 
     result = main(
@@ -224,6 +237,7 @@ if __name__ == "__main__":
         object_store_gb=args.object_store_gb,
         per_actor_model_bytes=int(args.per_actor_model_gb * 1024**3),
         output_padding_bytes=args.output_padding_kb * 1024,
+        num_cpus=args.num_cpus,
     )
     # Last line is machine-readable JSON; everything else goes to stderr.
     print(json.dumps(result))
