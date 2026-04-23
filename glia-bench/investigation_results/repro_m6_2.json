@@ -1,0 +1,1 @@
+{"wall_time_sec": 7.924, "throughput_blocks_per_sec": 63.1, "throughput_rows_per_sec": 63.1, "driver_cpu_per_wall": 0.831, "total_rows_observed": 500, "num_blocks": 500, "num_rows": 5000000, "concurrency": [1, 16], "sleep_ms": 50, "model_bytes": 107374182}
