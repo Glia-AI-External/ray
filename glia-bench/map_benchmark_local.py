@@ -60,7 +60,9 @@ def main(sleep_ms: int,
          concurrency_min: int,
          concurrency_max: int,
          batch_size: int,
-         object_store_gb: float = 0.0) -> dict:
+         object_store_gb: float = 0.0,
+         per_actor_model_bytes: int = 0,
+         output_padding_bytes: int = 0) -> dict:
     import ray
     import ray.data
 
@@ -81,20 +83,55 @@ def main(sleep_ms: int,
         init_kwargs["object_store_memory"] = int(object_store_gb * 1024**3)
     ray.init(ignore_reinit_error=True, **init_kwargs)
 
-    dummy_model = numpy.zeros(model_bytes, dtype=numpy.int8)
-    model_ref = ray.put(dummy_model)
-    del dummy_model
+    # Shared model (matches map_benchmark.py semantics) unless the caller
+    # asks for per-actor models via per_actor_model_bytes.
+    model_ref = None
+    if per_actor_model_bytes == 0 and model_bytes > 0:
+        dummy_model = numpy.zeros(model_bytes, dtype=numpy.int8)
+        model_ref = ray.put(dummy_model)
+        del dummy_model
 
     class IncrementBatch:
-        """Mirror of map_benchmark.py's IncrementBatch class."""
-        def __init__(self, model_ref, sleep_ms):
-            self.model = ray.get(model_ref)   # realizes model_bytes in actor heap
+        """Mirror of map_benchmark.py's IncrementBatch class, with two
+        optional knobs for forcing single-node plasma pressure:
+
+        - If model_ref is None (per-actor model mode), each actor allocates
+          its OWN 1 GB buffer via ray.put() at init time. On a single-node
+          cluster this forces N unique plasma entries (one per actor),
+          simulating the multi-node broadcast behavior where every node's
+          object store holds its own model copy.
+
+        - output_padding_bytes inflates each output batch with a column of
+          zeros of the given per-row byte width, so in-flight outputs build
+          up real plasma pressure as the pipeline runs.
+        """
+        def __init__(self, model_ref, sleep_ms, per_actor_model_bytes=0,
+                     output_padding_bytes=0):
+            if model_ref is not None:
+                self.model = ray.get(model_ref)
+            elif per_actor_model_bytes > 0:
+                # Per-actor model: each actor writes a UNIQUE object into
+                # plasma. Sum across the pool = N × per_actor_model_bytes.
+                import numpy as _np
+                self._unique_model_ref = ray.put(
+                    _np.zeros(per_actor_model_bytes, dtype=_np.int8)
+                )
+                self.model = ray.get(self._unique_model_ref)
+            else:
+                self.model = None
             self.sleep_ms = sleep_ms
+            self.output_padding_bytes = output_padding_bytes
 
         def __call__(self, batch):
             if self.sleep_ms > 0:
                 time.sleep(self.sleep_ms / 1000.0)
             batch["column00"] = batch["column00"] + 1
+            if self.output_padding_bytes > 0:
+                import numpy as _np
+                n = len(batch["column00"])
+                batch["padding"] = _np.zeros(
+                    (n, self.output_padding_bytes), dtype=_np.int8
+                )
             return batch
 
     def to_column00(batch):
@@ -113,7 +150,9 @@ def main(sleep_ms: int,
     ds = ds.map_batches(to_column00, batch_format="numpy", batch_size=batch_size)
     ds = ds.map_batches(
         IncrementBatch,
-        fn_constructor_args=[model_ref, sleep_ms],
+        fn_constructor_args=[
+            model_ref, sleep_ms, per_actor_model_bytes, output_padding_bytes
+        ],
         batch_format="numpy",
         batch_size=batch_size,
         concurrency=(concurrency_min, concurrency_max),
@@ -160,6 +199,18 @@ if __name__ == "__main__":
                          "this many GB. Used to force memory pressure that "
                          "matches what the reviewer saw on his cluster. "
                          "0 = use Ray's default (~30%% of RAM).")
+    ap.add_argument("--per-actor-model-gb", type=float, default=0.0,
+                    help="If > 0, each actor puts its OWN unique plasma "
+                         "object of this size at init (no sharing). On a "
+                         "single-node cluster this simulates the multi-node "
+                         "broadcast regime where every node's object store "
+                         "holds its own model copy. When set, --model-gb is "
+                         "ignored.")
+    ap.add_argument("--output-padding-kb", type=int, default=0,
+                    help="If > 0, each output batch includes a padding "
+                         "column of this many KB per row. Inflates in-flight "
+                         "output data so pending-output plasma pressure "
+                         "builds up during the run.")
     args = ap.parse_args()
 
     result = main(
@@ -171,6 +222,8 @@ if __name__ == "__main__":
         concurrency_max=args.concurrency_max,
         batch_size=args.batch_size,
         object_store_gb=args.object_store_gb,
+        per_actor_model_bytes=int(args.per_actor_model_gb * 1024**3),
+        output_padding_bytes=args.output_padding_kb * 1024,
     )
     # Last line is machine-readable JSON; everything else goes to stderr.
     print(json.dumps(result))
