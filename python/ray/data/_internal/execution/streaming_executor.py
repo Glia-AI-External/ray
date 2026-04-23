@@ -24,6 +24,9 @@ from ray.data._internal.execution.interfaces import (
 from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
+from ray.data._internal.execution.operators.actor_pool_map_operator import (
+    ActorPoolMapOperator,
+)
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.execution.resource_manager import (
     ResourceManager,
@@ -496,6 +499,20 @@ class StreamingExecutor(Executor, threading.Thread):
             # restores exact state, so the approximation here is bounded
             # to a single step.
             self._resource_manager.on_task_dispatched(op)
+
+            # Exception: actor-pool ops have
+            # `incremental_resource_usage() == (0, 0, 0)` (submitting a task
+            # to an existing actor doesn't reserve additional resources), so
+            # the incremental hook above is a no-op for them. Without a
+            # refresh, the op's budget — including its object_store_memory
+            # share — stays frozen at the top-of-step value while the op
+            # accumulates pending-output bytes in plasma through the step.
+            # `can_submit_new_task()` keeps returning True past the real
+            # ceiling and the op over-commits plasma. Force a full budget
+            # refresh after each actor-op dispatch so its object-store
+            # accounting stays fresh. Task ops keep the fast path.
+            if isinstance(op, ActorPoolMapOperator):
+                self._resource_manager.update_usages()
 
             i += 1
             if i % self._progress_manager.TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS == 0:
