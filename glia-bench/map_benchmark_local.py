@@ -59,7 +59,8 @@ def main(sleep_ms: int,
          num_blocks: int,
          concurrency_min: int,
          concurrency_max: int,
-         batch_size: int) -> dict:
+         batch_size: int,
+         object_store_gb: float = 0.0) -> dict:
     import ray
     import ray.data
 
@@ -69,6 +70,16 @@ def main(sleep_ms: int,
                  "ray.data._internal.execution.resource_manager",
                  "ray.data._internal.execution.backpressure_policy"):
         logging.getLogger(name).setLevel(logging.INFO)
+
+    init_kwargs = {}
+    if object_store_gb > 0:
+        # Constrain the plasma object store to force memory pressure. When
+        # the sum (models + in-flight data + pending outputs) approaches the
+        # budget, the ReservationOpResourceAllocator starts applying
+        # backpressure — this is the regime the reviewer saw on his 100-node
+        # cluster (481 GiB / 448 GiB object store, sustained spilling).
+        init_kwargs["object_store_memory"] = int(object_store_gb * 1024**3)
+    ray.init(ignore_reinit_error=True, **init_kwargs)
 
     dummy_model = numpy.zeros(model_bytes, dtype=numpy.int8)
     model_ref = ray.put(dummy_model)
@@ -144,6 +155,11 @@ if __name__ == "__main__":
     ap.add_argument("--concurrency-min", type=int, default=1)
     ap.add_argument("--concurrency-max", type=int, default=16)
     ap.add_argument("--batch-size", type=int, default=10_000)
+    ap.add_argument("--object-store-gb", type=float, default=0.0,
+                    help="If > 0, constrains Ray's object_store_memory to "
+                         "this many GB. Used to force memory pressure that "
+                         "matches what the reviewer saw on his cluster. "
+                         "0 = use Ray's default (~30%% of RAM).")
     args = ap.parse_args()
 
     result = main(
@@ -154,6 +170,7 @@ if __name__ == "__main__":
         concurrency_min=args.concurrency_min,
         concurrency_max=args.concurrency_max,
         batch_size=args.batch_size,
+        object_store_gb=args.object_store_gb,
     )
     # Last line is machine-readable JSON; everything else goes to stderr.
     print(json.dumps(result))
