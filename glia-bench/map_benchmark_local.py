@@ -63,7 +63,8 @@ def main(sleep_ms: int,
          object_store_gb: float = 0.0,
          per_actor_model_bytes: int = 0,
          output_padding_bytes: int = 0,
-         num_cpus: int = 0) -> dict:
+         num_cpus: int = 0,
+         disable_spilling: bool = False) -> dict:
     import ray
     import ray.data
 
@@ -88,6 +89,15 @@ def main(sleep_ms: int,
         # max_concurrency and matches the reviewer's regime where actor +
         # task CPU demand exceeded cluster CPU capacity (1706/800).
         init_kwargs["num_cpus"] = num_cpus
+    if disable_spilling:
+        # Remove plasma's pressure-release valve. When the object store
+        # fills, Ray can't spill to disk, so the producer must block.
+        # Amplifies any over-commitment caused by M5's zero-delta into a
+        # visible stall, matching the reviewer's can't-drain regime on
+        # his multi-node cluster.
+        init_kwargs["_system_config"] = {
+            "automatic_object_spilling_enabled": False,
+        }
     ray.init(ignore_reinit_error=True, **init_kwargs)
 
     # Shared model (matches map_benchmark.py semantics) unless the caller
@@ -224,6 +234,12 @@ if __name__ == "__main__":
                          "to cap out below max_concurrency and to force "
                          "CPU over-subscription matching the reviewer's "
                          "regime (1706 CPU demand / 800 cluster CPU).")
+    ap.add_argument("--disable-spilling", action="store_true",
+                    help="Disable plasma's automatic spill-to-disk release "
+                         "valve. When the object store fills, Ray can't "
+                         "relieve pressure by moving objects to disk, so "
+                         "the producer must block. Amplifies over-commit "
+                         "from M5's zero-delta into visible stall.")
     args = ap.parse_args()
 
     result = main(
@@ -238,6 +254,7 @@ if __name__ == "__main__":
         per_actor_model_bytes=int(args.per_actor_model_gb * 1024**3),
         output_padding_bytes=args.output_padding_kb * 1024,
         num_cpus=args.num_cpus,
+        disable_spilling=args.disable_spilling,
     )
     # Last line is machine-readable JSON; everything else goes to stderr.
     print(json.dumps(result))
