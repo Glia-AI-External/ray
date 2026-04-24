@@ -32,7 +32,7 @@ OUT="${SCRIPT_DIR}/results/optimization_perf.jsonl"
 WORKLOAD="${1:-all}"
 N_RUNS="${2:-5}"
 if [ "$WORKLOAD" = "all" ]; then
-    WORKLOADS=(synthetic mixed_pipeline medium_tasks long_tasks)
+    WORKLOADS=(synthetic mixed_pipeline medium_tasks long_tasks actor_backpressure)
 else
     WORKLOADS=("$WORKLOAD")
 fi

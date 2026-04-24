@@ -21,5 +21,17 @@
         "num_blocks": 50,
         "sleep_per_task": 0.5,
         "range_offset": 0
+    },
+    "actor_backpressure": {
+        "num_rows": 20000000,
+        "num_blocks": 5000,
+        "sleep_ms": 50,
+        "per_actor_model_bytes": 104857600,
+        "output_padding_bytes_per_row": 51200,
+        "concurrency_min": 1,
+        "concurrency_max": 50,
+        "object_store_gb": 6.0,
+        "num_cpus": 32,
+        "batch_size": 10000
     }
 }

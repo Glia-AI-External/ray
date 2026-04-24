@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -1280,6 +1280,137 @@ def test_on_task_dispatched_clamps_at_zero_never_negative(restore_data_context):
     assert budget.gpu == 0.0
     assert budget.object_store_memory == 0.0
     assert budget.memory == 0.0
+
+
+def test_on_task_dispatched_decrements_object_store_memory_by_predicted_output(
+    restore_data_context,
+):
+    """``on_task_dispatched`` decrements the op's budget's ``object_store_memory``
+    by ``op.metrics.obj_store_mem_max_pending_output_per_task``, independently of
+    what ``incremental_resource_usage()`` reports for that dimension.
+
+    Why this is the right shape:
+    - ``incremental_resource_usage()`` reports what Ray core reserves at
+      dispatch (CPU/GPU/memory). Plasma is *not* a Ray-core reservation —
+      it is committed reactively as the task writes its output, not reserved
+      at dispatch. So operators correctly return ``object_store_memory=0``
+      from ``incremental_resource_usage()``.
+    - But ``can_submit_new_task()`` gates on
+      ``budget.object_store_memory >= op.metrics.obj_store_mem_max_pending_output_per_task``,
+      so the budget's object-store dimension *must* decrement per dispatch
+      or the op silently over-commits plasma within a scheduling step.
+    - The fix uses the same per-task-max metric the gate already reads, so
+      the "decrement here" and "check there" are consistent.
+
+    The extreme case this matters: actor-pool ops. Their
+    ``incremental_resource_usage()`` is ``(0, 0, 0)`` entirely (submitting
+    to an existing actor reserves nothing new), so without this fix nothing
+    at all decrements their budget within a scheduling step.
+    """
+    input_op = InputDataBuffer(DataContext.get_current(), MagicMock())
+    op2 = mock_map_op(input_op=input_op, ray_remote_args={"num_cpus": 1})
+    # Simulate an actor-style op: incremental_resource_usage reports
+    # nothing (actor dispatch to an existing actor reserves no additional
+    # Ray-core resources).
+    op2.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=0, gpu=0)
+    )
+    # Simulate a predicted per-task output of 100 MiB. This is the
+    # estimate `can_submit_new_task` gates on. The property is computed,
+    # so patch it at class level for the duration of the test.
+    per_task_output_bytes = 100 * 1024 * 1024
+
+    topo = build_streaming_topology(op2, ExecutionOptions())
+    rm = ResourceManager(
+        topo,
+        ExecutionOptions(),
+        MagicMock(
+            return_value=ExecutionResources(
+                cpu=8, gpu=0, object_store_memory=10 * per_task_output_bytes
+            )
+        ),
+        DataContext.get_current(),
+    )
+    rm.update_usages()
+    alloc = rm._op_resource_allocator
+    assert isinstance(alloc, ReservationOpResourceAllocator)
+
+    before_budget = alloc.get_budget(op2)
+    assert before_budget is not None
+    assert before_budget.object_store_memory > 0, (
+        "Test precondition: op should have nonzero object-store budget "
+        "so the decrement is observable."
+    )
+    before_obj_store = before_budget.object_store_memory
+
+    with patch.object(
+        type(op2.metrics),
+        "obj_store_mem_max_pending_output_per_task",
+        new_callable=PropertyMock,
+        return_value=per_task_output_bytes,
+    ):
+        rm.on_task_dispatched(op2)
+
+    after_budget = alloc.get_budget(op2)
+    # object-store dimension must decrement by the predicted per-task
+    # output, clamped at zero. This is the fix — previously the whole
+    # decrement was a no-op for actor ops since incremental_resource_usage
+    # was (0, 0, 0) and object_store_memory is not part of it.
+    expected_after_obj_store = max(
+        before_obj_store - per_task_output_bytes, 0.0
+    )
+    assert after_budget.object_store_memory == expected_after_obj_store, (
+        f"Expected object_store_memory to decrement by {per_task_output_bytes}; "
+        f"before={before_obj_store}, after={after_budget.object_store_memory}"
+    )
+    # CPU dimension should stay the same since
+    # incremental_resource_usage() returns cpu=0 (actor-pool semantics).
+    assert after_budget.cpu == before_budget.cpu
+
+
+def test_on_task_dispatched_no_decrement_when_per_task_output_metric_missing(
+    restore_data_context,
+):
+    """If ``obj_store_mem_max_pending_output_per_task`` is not yet known
+    (before the first task completes, the running-max metric is 0/None),
+    ``on_task_dispatched`` should not decrement the budget's object-store
+    dimension. This matches reality: we can't predict the output size
+    until at least one task has produced output.
+    """
+    input_op = InputDataBuffer(DataContext.get_current(), MagicMock())
+    op2 = mock_map_op(input_op=input_op, ray_remote_args={"num_cpus": 1})
+    op2.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=0, gpu=0)
+    )
+
+    topo = build_streaming_topology(op2, ExecutionOptions())
+    rm = ResourceManager(
+        topo,
+        ExecutionOptions(),
+        MagicMock(
+            return_value=ExecutionResources(
+                cpu=8, gpu=0, object_store_memory=1 * 1024 * 1024 * 1024
+            )
+        ),
+        DataContext.get_current(),
+    )
+    rm.update_usages()
+    alloc = rm._op_resource_allocator
+    before_obj_store = alloc.get_budget(op2).object_store_memory
+    # Metric not populated yet (freshly-started op, no tasks finished) —
+    # property returns None.
+    with patch.object(
+        type(op2.metrics),
+        "obj_store_mem_max_pending_output_per_task",
+        new_callable=PropertyMock,
+        return_value=None,
+    ):
+        rm.on_task_dispatched(op2)
+    after_obj_store = alloc.get_budget(op2).object_store_memory
+    assert after_obj_store == before_obj_store, (
+        "When per-task-output metric is unknown (0/None), budget's "
+        "object_store_memory should not decrement."
+    )
 
 
 def test_execution_resources_subtract_clamp_zero():
