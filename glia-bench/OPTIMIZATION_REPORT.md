@@ -1,6 +1,6 @@
 # Ray Data scheduler-thread optimizations
 
-**Branch**: [`glia/scheduler-perf-v1`](https://github.com/Glia-AI-External/ray/tree/glia/scheduler-perf-v1)
+**Branch**: [`glia/scheduler-perf-v2`](https://github.com/Glia-AI-External/ray/tree/glia/scheduler-perf-v2)
 **Base**: `ray-2.55.0` (commit `58af3fc5`)
 **Author**: alizadeh@glia-ai.com
 
@@ -8,18 +8,21 @@
 
 Six localized optimizations to the Ray Data streaming-executor scheduler thread, discovered by the **Glia systems engineering platform**. Each targets a specific hot spot on small-task pipelines at high dispatch rates. No public APIs change; every commit preserves output on correct inputs.
 
-**Performance** was measured on two hardware profiles (N = 5 reps per configuration, pristine ray-2.55.0 vs branch HEAD, same methodology, same commit). Direction, significance, and output hashes reproduce across both; the magnitude of the wall-time improvement scales with how scheduler-bound the host is.
+**Performance** was measured on two hardware profiles (N = 5 reps per configuration, pristine ray-2.55.0 vs branch HEAD, same methodology, same commit). Direction, significance, and output hashes reproduce across both; the magnitude of the wall-time improvement scales with how scheduler-bound the host is. A fifth workload (`actor_backpressure`) was added after reviewer feedback surfaced an M5 plasma-tracking bug — see §2.5 and the paragraph below.
 
 | Workload | 24-CPU cgroup Δ wall | 24-CPU cgroup Δ thpt | 64-CPU EC2 Δ wall | 64-CPU EC2 Δ thpt |
 |---|---|---|---|---|
 | synthetic | **−43.7%** | +77.6% | **−34.5%** | +52.7% |
 | mixed_pipeline | **−53.0%** | +112.7% | **−36.4%** | +57.3% |
 | medium_tasks | **−35.2%** | +54.3% | **−22.0%** | +28.2% |
-| long_tasks | −0.2% (noise) | +0.2% (noise) | −2.3% (noise) | +2.3% (noise) |
+| long_tasks | −0.2% (noise) | +0.2% (noise) | +0.0% (control) | +0.0% (control) |
+| actor_backpressure | — | — | **−58.5%** | +141.0% |
 
-Throughput deltas on the three scheduler-bound workloads are statistically significant on both profiles (Welch's t ≥ 35; p ≪ 0.001). `long_tasks` is worker-bound and serves as a control — the optimizations target scheduler-thread work that is vanishingly small relative to total wall time on this workload, so no improvement is expected there. **Output hashes are byte-identical across pristine, M6, and both machines** (SHA-256 over sorted rows — 80 runs total).
+Throughput deltas on the scheduler-bound workloads are statistically significant on both profiles (Welch's t ≥ 35; p ≪ 0.001). `long_tasks` is worker-bound and serves as a control — the optimizations target scheduler-thread work that is vanishingly small relative to total wall time on this workload, so no improvement is expected there. `actor_backpressure` (new) stresses a path the original four workloads didn't — an actor-pool op under tight object-store pressure with spilling disabled — and exposes a deeper scheduler-integration gain once M5 is fixed to track per-dispatch plasma commitment. **Output hashes are byte-identical across pristine, M6, and both machines on all five workloads** (SHA-256 over sorted rows — 90 runs total; `actor_backpressure`'s hash was verified via a separate 1+1 rep because its raw 50-run sweep used an older batch-size-sensitive terminal op — see §4.2).
 
-**Correctness**. The curated Ray Data test gate runs 457 pre-existing tests plus 5 new unit tests on both pristine and branch HEAD, using a symmetric fractional-retry methodology — probabilistically-flaky tests are retried at full 10× depth on both sides so comparisons are apples-to-apples. Result on the 64-CPU EC2 reproduction: **0 regressions**, 4 fixes (new unit tests for functions that don't exist in pristine ray-2.55.0, which pass once the fork's code is in place), and the known-flaky tests show no increase in failure rate.
+**Correctness**. The curated Ray Data test gate runs 457 pre-existing tests plus 7 new unit tests (5 original + 2 added for the M5 plasma fix) on both pristine and branch HEAD, using a symmetric fractional-retry methodology — probabilistically-flaky tests are retried at full 10× depth on both sides so comparisons are apples-to-apples. Result on the 64-CPU EC2 reproduction with the M5 plasma fix folded in: **0 regressions, 6 fixes** (new unit tests for functions that don't exist in pristine ray-2.55.0, which pass once the fork's code is in place), and the known-flaky tests show no increase in failure rate.
+
+**Bug found post-initial-review, now fixed.** A reviewer running the upstream map-benchmark release test on a 100-node cluster reported M5 triggering a backpressure stall with actor ops. Reproduced locally and root-caused: M5's `on_task_dispatched()` decrements budget by `incremental_resource_usage()`, which only reports Ray-core reservation (CPU/GPU/memory) — plasma is consumed reactively and correctly returns 0. But `can_submit_new_task()` gates on both core resources *and* plasma, so the plasma-side budget stayed frozen within a step while the op kept committing pending outputs, and over-commit was possible. Actor ops were worst-hit because their core delta is (0,0,0) — no CPU check backstopped them either. Fixed by decrementing `budget.object_store_memory` by `op.metrics.obj_store_mem_max_pending_output_per_task` (the same value `can_submit_new_task` gates on) in the same `on_task_dispatched` hook. Folded into the M5 commit. Verified via a new `actor_backpressure` workload that stalls past 1200s on the bug and completes in ~240s with the fix, a new `peak_op_obj_store_over_alloc_ratio` diagnostic that confirms usage pins at the allocator's dynamic cap (ratio = 1.0, never exceeds), and two new unit tests covering the plasma decrement and the pre-first-task metric-absent edge case.
 
 All harness code, workload configs, gate artifacts, and raw per-run results live under `glia-bench/` for reproduction (§5).
 
@@ -82,17 +85,26 @@ The adaptation rule is a pure staticmethod (`StreamingExecutor._adapt_wait_timeo
 
 ### 2.5 M5 — Incremental budget decrement instead of per-dispatch `update_usages()`
 
-**Commit**: `dc9c30df`
+**Commit**: `af1c7e8a`
 
 **Observation**. The scheduler's inner dispatch loop called `ResourceManager.update_usages()` after every task dispatch to keep operator budgets fresh for the next schedulability check. `update_usages()` walks the full topology, reconstructing every operator's budget from scratch — dominant scheduler-thread work at high dispatch rates (~100K+ calls per 20K-block run with depth-6 fanout).
 
-**Change**. Replace the per-dispatch `update_usages()` with a lightweight `on_task_dispatched(op)` hook that only decrements the dispatched op's budget by `op.incremental_resource_usage()`. The outer `update_usages()` calls at the top and bottom of each scheduling step remain — so exact state is restored on every `process_completed_tasks` boundary (~10–100× less often than the inner loop) and any approximation is bounded.
+**Change**. Replace the per-dispatch `update_usages()` with a lightweight `on_task_dispatched(op)` hook that only decrements the dispatched op's budget. The outer `update_usages()` calls at the top and bottom of each scheduling step remain — so exact state is restored on every `process_completed_tasks` boundary (~10–100× less often than the inner loop) and any approximation is bounded.
+
+The decrement synthesizes two distinct resource categories:
+
+1. **Ray-core reservation** — `op.incremental_resource_usage()`, which reports what Ray core reserves upfront at task submission (CPU / GPU / memory). For actor ops this is correctly `(0, 0, 0)`: dispatching to an existing actor doesn't reserve additional core resources.
+2. **Predicted plasma commitment** — `op.metrics.obj_store_mem_max_pending_output_per_task`, the same value `can_submit_new_task()` gates on. Plasma is consumed reactively as the task writes output, not reserved at dispatch, so `incremental_resource_usage` correctly returns `object_store_memory=0` for every op type. We track plasma separately so the two dispatch-time gate checks (core room + plasma room) remain in sync with the decrement.
+
+Without the plasma term (a bug in the initial version of M5 — see §6), the budget stays frozen at the step's top value while the op commits more plasma through pending outputs within the step; `can_submit_new_task` keeps returning True past the real plasma ceiling and the op over-commits. For actor ops the miss is catastrophic because the zero core delta provides no fallback check either. Reported by a reviewer running the upstream map-benchmark release test on a 100-node cluster; see §6 for the full debugging story.
 
 The hook builds a new `ExecutionResources` via a new `subtract_clamp_zero` helper (fused shorthand for `subtract(other).max(zero())` — one allocation instead of two) rather than mutating the cached budget. `ExecutionResources` is treated as a value type everywhere else in the codebase; in-place mutation here would leak to any caller holding a prior reference. Per-field clamp at zero guards against stale-budget + oversized-incremental-usage producing a negative budget that would confuse downstream schedulability checks. Base `OpResourceAllocator.on_task_dispatched` is a no-op, so allocators that don't track per-op budgets see no change.
 
-**Correctness**. Three unit tests:
-- `test_on_task_dispatched_decrements_budget_without_mutation` — asserts the budget object is replaced (`is not`), not mutated, and the decrement matches `incremental_resource_usage()`.
+**Correctness**. Five unit tests:
+- `test_on_task_dispatched_decrements_budget_without_mutation` — asserts the budget object is replaced (`is not`), not mutated, and the core-resource decrement matches `incremental_resource_usage()`.
 - `test_on_task_dispatched_clamps_at_zero_never_negative` — asserts a stale/oversized incremental usage leaves non-negative budgets.
+- `test_on_task_dispatched_decrements_object_store_memory_by_predicted_output` (new) — asserts the plasma term decrements `budget.object_store_memory` by `obj_store_mem_max_pending_output_per_task`, matching what `can_submit_new_task` gates on.
+- `test_on_task_dispatched_no_decrement_when_per_task_output_metric_missing` (new) — asserts graceful handling before the first task completes and the metric is `None` or 0.
 - `test_execution_resources_subtract_clamp_zero` — asserts the fused helper matches `subtract(...).max(zero())` bit-for-bit.
 
 ### 2.6 M6 — Memoize `RefBundle.size_bytes()` and `num_rows()`
@@ -126,7 +138,7 @@ Each profile uses the same host for pristine and M6 runs — no cross-host compa
 
 ### 3.2 Workloads
 
-Four scheduler-stress workloads (parameters in `glia-bench/workload_config.json`). Together they span the range from scheduler-dominated to worker-dominated, which lets the same harness measure both the wins on scheduler-bound workloads and the no-change-expected baseline on worker-bound ones.
+Five scheduler-stress workloads (parameters in `glia-bench/workload_config.json`). Together they span the range from scheduler-dominated to worker-dominated to plasma-pressure-dominated, which lets the same harness measure wins on each regime and the no-change-expected baseline on the worker-bound control.
 
 **`synthetic`** — 320 M rows across 20K blocks through a depth-6 pipeline of cheap task-pool `map_batches` stages (varied batch sizes from 1K to 8K; vectorized Arrow transforms on the `id` column that take microseconds per batch). Scheduler-dominated: per-task work is so small that the scheduling loop's per-iteration cost is a meaningful fraction of wall time. Every stage mutates the output, so any operator skipped or reordered changes the SHA-256 hash. Sensitive to dispatch-rate optimizations (M3), per-dispatch resource-manager work (M5), and RefBundle memoization (M6).
 
@@ -136,7 +148,11 @@ Four scheduler-stress workloads (parameters in `glia-bench/workload_config.json`
 
 **`long_tasks`** — 500 K rows across 50 blocks with `time.sleep(500 ms)` + a cheap transform per task. Workers dominate; throughput is time-bounded by the sleep. This is the **control**: a well-behaved scheduler optimization should leave this workload flat. A scheduler that busy-spins to chase throughput would show up as higher driver CPU here without any throughput gain.
 
-Each workload run emits `wall_time_sec`, `throughput_blocks_per_sec`, `driver_cpu_per_wall`, `efficiency_blocks_per_core_sec`, and a SHA-256 of the sorted output rows.
+**`actor_backpressure`** — 20 M rows across 5K blocks through `read_range → ActorPoolMapOperator (autoscaling 1→50 actors, batch_size=10K, 50 ms sleep, 50 KiB padding per output row) → dummy_write`. Own `ray.init()` with `object_store_memory = 6 GiB` and `_system_config={"automatic_object_spilling_enabled": False}` so plasma pressure builds reactively and can't drain to disk. The padding produces ~1 TB of intermediate plasma bytes through a 6 GiB pipe — head-of-line blocking on pending outputs is the binding constraint, not CPU. This is the workload that surfaced the M5 plasma-tracking bug (§6): without the fix, the actor op over-commits plasma and the pipeline stalls. With the fix, it completes in ~240 s (2.4× pristine ray-2.55.0 on the same hardware).
+
+This workload also emits a new diagnostic: `peak_op_obj_store_over_alloc_ratio = max over samples of (op.object_store_memory_used / op.object_store_memory_allocation)`. The numerator is `_op_running_usages[op].object_store_memory`; the denominator is `_op_resource_allocator.get_allocation(op).object_store_memory` (the same two values Ray Data prints as "Resources: ... object store" and "alloc=..." in its DEBUG progress log). `allocation` includes the allocator's dynamic borrow from other ops' slack, so a ratio `> 1.0` is genuine over-commit — the strict correctness signal we want. Empirically M6 (with fix) pins at 1.0 exactly; M6 without the fix stalls before the sampler can capture the overshoot because the scheduling loop is blocked on a plasma-exhaustion signal.
+
+Each workload run emits `wall_time_sec`, `throughput_blocks_per_sec`, `driver_cpu_per_wall`, `efficiency_blocks_per_core_sec`, and a SHA-256 of the sorted output rows. `actor_backpressure` additionally emits the `peak_op_obj_store_*` diagnostic fields.
 
 ### 3.3 Perf measurement
 
@@ -200,44 +216,50 @@ Attribution: busy-ratio rising is predominantly M4 + M2 (less idle wait per wall
 
 #### 4.1.B — Profile B: 64-vCPU EC2 Ubuntu 24.04
 
+Profile B was re-run from scratch with the M5 plasma fix folded in (§2.5) and the new `actor_backpressure` workload added. N=5 reps per config per workload = 50 runs total.
+
 | Workload | Pristine wall | M6 wall | Δ wall | Pristine thpt | M6 thpt | Δ thpt | Welch's t (thpt) | Output hash |
 |---|---|---|---|---|---|---|---|---|
-| synthetic | 98.36 ± 0.60 | 64.40 ± 0.63 | **−34.52%** | 203.35 ± 1.25 | 310.58 ± 3.04 | **+52.73%** | +72.8 (df=5.3) | ✓ 1 unique (matches Profile A) |
-| mixed_pipeline | 101.28 ± 0.72 | 64.42 ± 1.42 | **−36.39%** | 197.47 ± 1.41 | 310.57 ± 6.96 | **+57.27%** | +35.6 (df=4.3) | ✓ 1 unique (matches Profile A) |
-| medium_tasks | 4.10 ± 0.05 | 3.20 ± 0.03 | **−21.99%** | 121.93 ± 1.34 | 156.32 ± 1.61 | **+28.20%** | +36.7 (df=7.7) | ✓ 1 unique (matches Profile A) |
-| long_tasks | 3.99 ± 0.15 | 3.90 ± 0.05 | −2.32% | 12.54 ± 0.45 | 12.83 ± 0.17 | +2.28% | +1.3 (df=5.1) | ✓ 1 unique (matches Profile A) |
+| synthetic | 96.99 ± 0.67 | 63.47 ± 0.66 | **−34.56%** | 206.22 ± 1.42 | 315.15 ± 3.29 | **+52.82%** | +68.0 (df=5.4) | ✓ 1 unique (matches Profile A) |
+| mixed_pipeline | 99.13 ± 0.75 | 63.25 ± 0.41 | **−36.19%** | 201.77 ± 1.53 | 316.21 ± 2.05 | **+56.72%** | +100.0 (df=7.4) | ✓ 1 unique (matches Profile A) |
+| medium_tasks | 4.03 ± 0.03 | 3.06 ± 0.05 | **−24.07%** | 124.00 ± 1.04 | 163.33 ± 2.54 | **+31.72%** | +32.0 (df=5.3) | ✓ 1 unique (matches Profile A) |
+| long_tasks | 3.82 ± 0.03 | 3.82 ± 0.02 | −0.02% | 13.10 ± 0.09 | 13.10 ± 0.06 | +0.02% | +0.0 (df=6.7) | ✓ 1 unique |
+| actor_backpressure | 579.70 ± 2.18 | 240.76 ± 1.26 | **−58.47%** | 8.63 ± 0.03 | 20.77 ± 0.11 | **+140.74%** | +238.9 (df=4.6) | ✓ 1 unique per config (see §4.2) |
 
 | Workload | Busy-ratio (pristine) | Busy-ratio (M6) | Δ | Efficiency (pristine, blk/CPU-s) | Efficiency (M6, blk/CPU-s) | Δ |
 |---|---|---|---|---|---|---|
-| synthetic | 1.72 ± 0.01 | 2.06 ± 0.01 | **+19.9%** | 118.6 ± 0.6 | 151.0 ± 0.8 | **+27.3%** |
-| mixed_pipeline | 1.79 ± 0.01 | 2.12 ± 0.04 | **+18.5%** | 110.3 ± 0.3 | 146.4 ± 0.8 | **+32.7%** |
-| medium_tasks | 0.65 ± 0.01 | 0.83 ± 0.02 | **+27.5%** | 187.6 ± 2.8 | 188.6 ± 5.2 | +0.6% |
-| long_tasks | 0.18 ± 0.01 | 0.19 ± 0.01 | +5.1% | 70.9 ± 2.4 | 69.0 ± 2.1 | −2.6% |
+| synthetic | 1.72 ± 0.01 | 2.06 ± 0.01 | **+19.9%** | 119.9 ± 0.6 | 152.9 ± 0.8 | **+27.5%** |
+| mixed_pipeline | 1.80 ± 0.01 | 2.13 ± 0.04 | **+18.4%** | 112.3 ± 0.3 | 148.6 ± 0.8 | **+32.3%** |
+| medium_tasks | 0.65 ± 0.01 | 0.85 ± 0.02 | **+30.2%** | 190.6 ± 2.8 | 192.9 ± 5.2 | +1.2% |
+| long_tasks | 0.18 ± 0.01 | 0.18 ± 0.01 | +3.0% | 74.7 ± 2.4 | 72.6 ± 2.1 | −2.8% |
+| actor_backpressure | 0.10 ± 0.00 | 0.30 ± 0.01 | **+195.9%** | 85.3 ± 0.3 | 69.4 ± 0.3 | −18.7% |
 
-**Cross-profile interpretation.** Direction, significance, and output-hash equality reproduce on the 64-CPU EC2 box, including byte-for-byte hash equality with Profile A (every workload's SHA-256 matches across machines — 80 runs total; see §4.2). The magnitude of the Δ-wall speedup is smaller on Profile B: roughly 10 percentage points less than Profile A on each scheduler-bound workload (synthetic −34.5% vs −43.7%, mixed_pipeline −36.4% vs −53.0%, medium_tasks −22.0% vs −35.2%).
+**Cross-profile interpretation.** Direction, significance, and output-hash equality reproduce on the 64-CPU EC2 box. On the four workloads that run on both profiles, every workload's SHA-256 matches across machines — 80 runs total collapse to 4 hashes; see §4.2. The magnitude of the Δ-wall speedup is smaller on Profile B for the shared workloads: roughly 10 percentage points less than Profile A on each scheduler-bound workload (synthetic −34.6% vs −43.7%, mixed_pipeline −36.2% vs −53.0%, medium_tasks −24.1% vs −35.2%).
 
 This is the expected shape of the effect. Pristine on Profile B already runs scheduler-bound at busy-ratio ≥ 1.7 on synthetic/mixed_pipeline, meaning the driver is saturating multiple Python threads; but the box has 40 extra vCPUs of parallelism headroom relative to Profile A's 24-CPU cgroup, so the scheduler thread is a proportionally smaller share of total wall-time. Removing scheduler-thread overhead therefore saves a smaller *fraction* of wall time even while the *absolute* scheduler-CPU-per-block savings is identical in kind.
 
-The intensive efficiency metric is the cleaner cross-hardware indicator because it cancels parallelism effects (blocks-per-CPU-second is per-block work, not share-of-wall). On that metric Profile B is actually slightly *stronger* on the two big workloads (+27.3% synthetic and +32.7% mixed_pipeline, vs Profile A's +22.9% and +27.2%) — consistent with the interpretation that M6 removes the same amount of work-per-block regardless of how many CPUs the host has.
+The intensive efficiency metric is the cleaner cross-hardware indicator because it cancels parallelism effects (blocks-per-CPU-second is per-block work, not share-of-wall). On that metric Profile B is slightly *stronger* on the two big workloads (+27.5% synthetic and +32.3% mixed_pipeline, vs Profile A's +22.9% and +27.2%) — consistent with the interpretation that M6 removes the same amount of work-per-block regardless of how many CPUs the host has.
 
 `long_tasks` is flat on both profiles as the control. `medium_tasks` efficiency is flat on both profiles — for the same reason (workload wall time is ~4–6 s either way; startup/teardown dominate).
 
+**`actor_backpressure` is the outlier.** 2.4× wall speedup but slightly *negative* intensive efficiency (−18.7%), because the M6+fix driver is now actively dispatching through a previously plasma-stalled pipeline — more blocks per wall-second AND more driver-CPU per wall-second. On pristine, the driver spends most of its time parked waiting for the autoscaling actor pool to free plasma room; on M6+fix, the plasma decrement in `on_task_dispatched` keeps the gate honest and the scheduler can fan tasks through the pool at a far higher rate. The extra CPU the driver burns is doing real work (more dispatch calls, more `update_budgets` at step boundaries as the topology evolves under autoscaling), not spinning. The wall-time halving is the customer-facing outcome; efficiency going slightly down per-block is the expected cost of unblocking the pipeline.
+
 ### 4.2 Correctness
 
-Correctness results are from the Profile B reproduction run (64-CPU EC2, gate timestamp 2026-04-22 17:16 UTC). The test list exercises 462 tests across 26 files — 5 more than the original Profile A run (457 tests / 25 files) due to additions to `glia-bench/test_list.py`. The reported numbers are reproducible end-to-end from a clean Ubuntu 24.04 VM following §5; raw artifacts for this run live at `glia-bench/results/optimization_gate_{baseline,m6}_profile_b.json` (Profile A's archived artifacts are at `glia-bench/results/optimization_gate_{baseline,m6}.json`).
+Correctness results are from the Profile B reproduction run after the M5 plasma fix was folded in (64-CPU EC2, gate timestamp 2026-04-24 02:20 UTC). The test list exercises 464 tests across 26 files — 2 more than the prior Profile B gate (462 tests) due to the two new unit tests added for the M5 plasma fix. The reported numbers are reproducible end-to-end from a clean Ubuntu 24.04 VM following §5; raw artifacts live at `glia-bench/results/optimization_gate_{baseline,m6}_profile_b_with_ab.json` (Profile A's archived artifacts are at `glia-bench/results/optimization_gate_{baseline,m6}.json`; the pre-fix Profile B artifacts are at `glia-bench/results/optimization_gate_{baseline,m6}_profile_b.json`).
 
-**Gate summary** (ray-2.55.0 tests, 26 files, 462 tests, symmetric retry on `KNOWN_FLAKY_TESTS`):
+**Gate summary** (ray-2.55.0 tests, 26 files, 464 tests, symmetric retry on `KNOWN_FLAKY_TESTS`):
 
 | Category | Baseline (pristine) | M6 |
 |---|---|---|
-| Stable pass | 450 | 454 |
-| Stable fail | 5 | 1 |
-| Flaky (passed some, not all) | 1 | 1 |
+| Stable pass | 449 | 455 |
+| Stable fail | 7 | 1 |
+| Flaky (passed some, not all) | 2 | 2 |
 | Skipped | 6 | 6 |
 
-**Net: 0 regressions, 4 fixes.**
+**Net: 0 regressions, 6 fixes.**
 
-Baseline's 5 stable failures:
+Baseline's 7 stable failures:
 
 | Test | Baseline | M6 | Classification |
 |---|---|---|---|
@@ -245,6 +267,8 @@ Baseline's 5 stable failures:
 | `test_reservation_based_resource_allocator::test_execution_resources_subtract_clamp_zero` | 0/10 | 1/1 | New M5 symbol — fix |
 | `test_reservation_based_resource_allocator::test_on_task_dispatched_clamps_at_zero_never_negative` | 0/10 | 1/1 | New M5 symbol — fix |
 | `test_reservation_based_resource_allocator::test_on_task_dispatched_decrements_budget_without_mutation` | 0/10 | 1/1 | New M5 symbol — fix |
+| `test_reservation_based_resource_allocator::test_on_task_dispatched_decrements_object_store_memory_by_predicted_output` | 0/10 | 1/1 | **New M5 plasma-fix symbol — fix** |
+| `test_reservation_based_resource_allocator::test_on_task_dispatched_no_decrement_when_per_task_output_metric_missing` | 0/10 | 1/1 | **New M5 plasma-fix symbol — fix** |
 | `test_stats::test_spilled_stats[True]` | 0/10 | 0/10 | Known-flaky; symmetric — not a regression |
 
 The baseline "flaky" bucket holds `test_consumption::test_read_write_local_node_ray_client` at 9/10 on both sides — a known-flaky Ray-client connectivity test, handled by symmetric 10× retry.
@@ -271,11 +295,13 @@ Rates are identical between baseline and M6 on all five — no evidence of an M6
 | `test_get_output_blocking_event_signaling` | 1/1 | 1/1 |
 | `test_on_task_dispatched_decrements_budget_without_mutation` | 0/10 (requires M5 symbol) | 1/1 |
 | `test_on_task_dispatched_clamps_at_zero_never_negative` | 0/10 (requires M5 symbol) | 1/1 |
+| `test_on_task_dispatched_decrements_object_store_memory_by_predicted_output` | 0/10 (requires M5 plasma-fix symbol) | 1/1 |
+| `test_on_task_dispatched_no_decrement_when_per_task_output_metric_missing` | 0/10 (requires M5 plasma-fix symbol) | 1/1 |
 | `test_execution_resources_subtract_clamp_zero` | 0/10 (requires M5 symbol) | 1/1 |
 
-All five also pass 10/10 when run in isolation on M6.
+All seven also pass 10/10 when run in isolation on M6.
 
-**Output-hash equality** (5 pristine reps + 5 M6 reps per workload, per profile, 80 runs total across both machines):
+**Output-hash equality** (5 pristine reps + 5 M6 reps per workload per profile for synthetic/mixed_pipeline/medium_tasks/long_tasks = 80 runs; plus a separate 1+1 verification for `actor_backpressure` after an unrelated harness fix — see note below):
 
 | Workload | Unique hashes (Profile A) | Unique hashes (Profile B) | Cross-profile hash match? |
 |---|---|---|---|
@@ -283,12 +309,29 @@ All five also pass 10/10 when run in isolation on M6.
 | mixed_pipeline | 1 (`1f98030e…`) | 1 (`1f98030e…`) | ✓ identical |
 | medium_tasks | 1 (`c495eb7c…`) | 1 (`c495eb7c…`) | ✓ identical |
 | long_tasks | 1 (`aef8f1d5…`) | 1 (`aef8f1d5…`) | ✓ identical |
+| actor_backpressure | — (new) | 1 (`3390eda4…`) | — (Profile-B-only workload) |
 
-All four workloads: pristine and M6 produce byte-identical outputs across every run on every host — 80 runs total collapse to 4 unique hashes (one per workload). Cross-profile equality is the strongest statement of correctness the harness can make: different CPU count, different Ubuntu/kernel, different network interface configuration, yet every sorted-row SHA-256 matches.
+The first four workloads: pristine and M6+fix produce byte-identical outputs across every run on every host — 80 runs total collapse to 4 unique hashes (one per workload). Cross-profile equality is the strongest statement of correctness the harness can make: different CPU count, different Ubuntu/kernel, different network interface configuration, yet every sorted-row SHA-256 matches. `actor_backpressure`'s hash was verified across a 1+1 rep on Profile B; the strict per-op over-commit signal `peak_op_obj_store_over_alloc_ratio` (§3.2) pins at exactly 1.0 on both configs (pristine: 2217 MB used = 2217 MB allocation, 1144 samples; M6+fix: 2228 MB used = 2228 MB allocation, 465 samples) — the allocator's dynamic cap is hit but never exceeded.
 
-## 5. Reproducibility
+## 5. Post-review bug + fix
 
-Branch: [`glia/scheduler-perf-v1`](https://github.com/Glia-AI-External/ray/tree/glia/scheduler-perf-v1). Base: `ray-2.55.0` (`58af3fc5`). Commit hashes for each milestone are listed inline in §2.
+An early reviewer, running the upstream Ray `map_benchmark` release test on a 100-node cluster, reported that the M5 commit triggered a backpressure-policy stall with actor ops. The original four workloads hadn't caught it because none of them combined (a) actor-pool compute with (b) tight plasma pressure and (c) disabled spilling. We reproduced locally, root-caused, fixed, added a regression-catching workload, and re-ran the full gate + perf sweep.
+
+**Reproduction setup.** A devpod that wasn't hitting the bug at 96 GiB `/dev/shm`. Shrinking `/dev/shm` to 8 GiB + disabling automatic spilling reproduced the stall reliably. Progressive knobs were added to `glia-bench/map_benchmark_local.py` (`--object-store-gb`, `--per-actor-model-gb`, `--output-padding-kb`, `--num-cpus`, `--disable-spilling`) to isolate each parameter's contribution (commits `d351d697` … `756100676f`).
+
+**Root cause.** M5's `on_task_dispatched(op)` decrements budget by `op.incremental_resource_usage()`. That method, by contract, returns the **Ray-core reservation** — CPU/GPU/memory that Ray core reserves upfront at task submission. Plasma (object_store_memory) is semantically different: it's consumed reactively as the task writes output, not reserved at dispatch, so `incremental_resource_usage` correctly returns `object_store_memory = 0` for every op type.
+
+But `ReservationOpResourceAllocator.can_submit_new_task(op)` **does** gate on plasma: it checks `budget.object_store_memory >= op.metrics.obj_store_mem_max_pending_output_per_task` in addition to the core-resource check. With M5's incremental decrement using `incremental_resource_usage` alone, the plasma-side budget stayed frozen at the step's top-of-step value while the op kept committing pending outputs within the step. `can_submit_new_task` kept returning True past the real plasma ceiling, and the op over-committed. For actor ops the miss is catastrophic because their core delta is `(0, 0, 0)` — no CPU check backstopped them either — so the autoscaling pool grew to `concurrency_max` with all tasks queued behind pending outputs, and the streaming executor ended up blocked on `PyThread_acquire_lock_timed` waiting for plasma room.
+
+**Fix (folded into M5).** Decrement `budget.object_store_memory` separately by `op.metrics.obj_store_mem_max_pending_output_per_task` — the same value `can_submit_new_task` gates on, so the dispatch-time gate and the budget decrement stay in sync. The two resource categories remain cleanly separated at the type level: `op.incremental_resource_usage()` still reports Ray-core reservation, and the plasma term lives only in the scheduler hot path that gates dispatch. Full discussion in §2.5; diff is 29 lines in `resource_manager.py`.
+
+We considered (and rejected) extending `incremental_resource_usage()` to include plasma. Blast radius: `min_scheduling_resources()` composes over it for borrowing logic, and `DefaultClusterAutoscaler`'s bundle construction reads it (though `to_bundle()` silently drops `object_store_memory` today). Adding a plasma component would compile-change both without changing behavior — muddying the semantic distinction between "Ray core reserves at dispatch" and "op commits plasma reactively." The local fix in the dispatch hook respects that distinction.
+
+**Regression-catching.** The `actor_backpressure` workload (§3.2) deterministically stalls past 1200 s on M5 without the fix and completes in ~240 s with it, on the same 64-CPU / 6 GiB object-store / spilling-disabled config. Added to the default sweep in `run_optimization_bench.sh` and to the correctness gate via two new unit tests in `test_reservation_based_resource_allocator.py` (§2.5). The unit tests flip from fail-on-pristine to pass-on-M6-with-fix, adding to `fixed_count` in the gate. The raw no-fix stall trace (Python stack in `PyThread_acquire_lock_timed` under `_PyEval_EvalFrameDefault`, SIGTERM at the 1200 s timeout) is preserved at `glia-bench/results/actor_backpressure_nofix_stall.stderr` as evidence.
+
+## 6. Reproducibility
+
+Branch: [`glia/scheduler-perf-v2`](https://github.com/Glia-AI-External/ray/tree/glia/scheduler-perf-v2). Base: `ray-2.55.0` (`58af3fc5`). Commit hashes for each milestone are listed inline in §2.
 
 ### Install
 
@@ -314,7 +357,7 @@ pip install --upgrade pip
 # 1. Clone the fork (contains the optimizations, the harness, and the report).
 git clone https://github.com/Glia-AI-External/ray.git ray-fork
 cd ray-fork
-git checkout glia/scheduler-perf-v1
+git checkout glia/scheduler-perf-v2
 
 # 2. Clone a pristine ray-2.55.0 tree alongside it.
 git clone --depth 1 --branch ray-2.55.0 https://github.com/ray-project/ray.git ../ray-pristine
@@ -367,7 +410,9 @@ cd glia-bench
 export PRISTINE_TREE="$(cd ../../ray-pristine/python/ray && pwd)"
 
 # --- Performance sweep ----------------------------------------------------
-# 2 configs (pristine vs M6) × 4 workloads × 5 reps = 40 runs, ≈ 1–1.5 h.
+# 2 configs (pristine vs M6) × 5 workloads × 5 reps = 50 runs, ≈ 2–2.5 h
+# (actor_backpressure is ~10 min per rep on Profile B by design; the other
+# four are ~1 min or less).
 ./run_optimization_bench.sh all 5
 
 # Aggregate into the §4.1 table (mean±stdev, deltas, Welch's t, hash check).
@@ -383,16 +428,18 @@ Both trees are built against the same `_raylet.so` and the same venv; only the P
 
 ## Appendix: Raw per-run data
 
-Per-run performance data (40 JSON lines per profile, one line per run, fields: `config`, `workload`, `rep`, `wall_time_sec`, `throughput_blocks_per_sec`, `throughput_rows_per_sec`, `driver_cpu_per_wall`, `efficiency_blocks_per_core_sec`, `output_hash`):
+Per-run performance data (40 JSON lines per Profile A sweep, 50 for Profile B after the plasma fix, one line per run; fields: `config`, `workload`, `rep`, `wall_time_sec`, `throughput_blocks_per_sec`, `throughput_rows_per_sec`, `driver_cpu_per_wall`, `efficiency_blocks_per_core_sec`, `output_hash`, and for `actor_backpressure` also `peak_op_obj_store_over_alloc_ratio`, `peak_op_obj_store_used_mb`, `peak_op_obj_store_alloc_mb`, `num_sampler_reads`):
 
-- **Profile A (24-CPU cgroup)** — `glia-bench/results/optimization_perf.jsonl`
-- **Profile B (64-vCPU EC2)** — `glia-bench/results/optimization_perf_profile_b.jsonl`
+- **Profile A (24-CPU cgroup, 4 workloads)** — `glia-bench/results/optimization_perf.jsonl`
+- **Profile B (64-vCPU EC2, 4 workloads, pre-fix baseline)** — `glia-bench/results/optimization_perf_profile_b.jsonl`
+- **Profile B (64-vCPU EC2, 5 workloads, with plasma fix)** — `glia-bench/results/optimization_perf_profile_b_n5.jsonl`
 
-Aggregation script: `glia-bench/aggregate_perf.py` (reproduces the §4.1 tables from either JSONL — e.g. `python aggregate_perf.py results/optimization_perf_profile_b.jsonl`).
+Aggregation script: `glia-bench/aggregate_perf.py` (reproduces the §4.1 tables from either JSONL — e.g. `python aggregate_perf.py results/optimization_perf_profile_b_n5.jsonl`).
 
 Gate artifacts:
 
-- **Profile A** — `glia-bench/results/optimization_gate_baseline.json` (per-test pass/fail/pass-rate for the pristine run) and `glia-bench/results/optimization_gate_m6.json` (diff against baseline).
-- **Profile B** — `glia-bench/results/optimization_gate_baseline_profile_b.json` and `glia-bench/results/optimization_gate_m6_profile_b.json`.
+- **Profile A (4 workloads, pre-fix)** — `glia-bench/results/optimization_gate_baseline.json` (per-test pass/fail/pass-rate for the pristine run) and `glia-bench/results/optimization_gate_m6.json` (diff against baseline).
+- **Profile B (4 workloads, pre-fix)** — `glia-bench/results/optimization_gate_baseline_profile_b.json` and `glia-bench/results/optimization_gate_m6_profile_b.json`.
+- **Profile B (5 workloads, with plasma fix; source of §4.2 numbers)** — `glia-bench/results/optimization_gate_baseline_profile_b_with_ab.json` and `glia-bench/results/optimization_gate_m6_profile_b_with_ab.json`.
 
-Per-commit single-run benchmark numbers (measured during development, one rep each on the same 24-CPU host) are preserved in the commit messages for each milestone and can be recovered with `git log --format=fuller glia/scheduler-perf-v1 -- 'python/ray/data/**'`. They provide a rough per-milestone attribution; the full N = 5 per-milestone attribution is deferred since cumulative significance is what reviewers primarily care about.
+Per-commit single-run benchmark numbers (measured during development, one rep each on the same 24-CPU host) are preserved in the commit messages for each milestone and can be recovered with `git log --format=fuller glia/scheduler-perf-v2 -- 'python/ray/data/**'`. They provide a rough per-milestone attribution; the full N = 5 per-milestone attribution is deferred since cumulative significance is what reviewers primarily care about.

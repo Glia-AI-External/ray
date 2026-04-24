@@ -1,0 +1,112 @@
+2026-04-24 03:02:29,370	INFO worker.py:2003 -- Started a local Ray instance. View the dashboard at [1m[32mhttp://127.0.0.1:8265 [39m[22m
+/home/ubuntu/ray-fork/python/ray/_private/worker.py:2051: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+2026-04-24 03:02:34,336	INFO worker.py:2003 -- Started a local Ray instance. View the dashboard at [1m[32mhttp://127.0.0.1:8265 [39m[22m
+2026-04-24 03:02:35,254	WARNING util.py:642 -- The argument ``concurrency`` is deprecated in Ray 2.51. Please specify argument ``compute`` instead. For more information, see https://docs.ray.io/en/master/data/transforming-data.html#stateful-transforms.
+2026-04-24 03:02:35,265	INFO logging.py:416 -- Registered dataset logger for dataset dataset_3_0
+2026-04-24 03:02:35,286	WARNING set_read_parallelism.py:66 -- ⚠️  The requested number of read blocks of 5000 is more than 4x the number of available CPU slots in the cluster of 32.0. This can lead to slowdowns during the data reading phase due to excessive task creation. Reduce the value to match with the available CPU slots in the cluster, or set override_num_blocks to -1 for Ray Data to automatically determine the number of read tasks blocks.You can ignore this message if the cluster is expected to autoscale.
+2026-04-24 03:02:35,286	INFO streaming_executor.py:184 -- Starting execution of Dataset dataset_3_0. Full logs are in /tmp/ray/session_2026-04-24_03-02-31_554798_1047387/logs/ray-data
+2026-04-24 03:02:35,286	INFO streaming_executor.py:185 -- Execution plan of Dataset dataset_3_0: InputDataBuffer[Input] -> TaskPoolMapOperator[ReadRange] -> ActorPoolMapOperator[MapBatches(to_column00)->MapBatches(IncrementBatch)] -> TaskPoolMapOperator[MapBatches(dummy_write)]
+2026-04-24 03:02:35,297	WARNING util.py:301 -- ⚠️  The requested parallelism of 5000 is more than 4x the number of available CPU slots in the cluster of 32.0. This can lead to slowdowns during the data reading phase due to excessive task creation. Reduce the parallelism to match with the available CPU slots in the cluster, or set parallelism to -1 for Ray Data to automatically determine the parallelism. You can ignore this message if the cluster is expected to autoscale.
+[2026-04-24 03:02:39,191 E 1047387 1047387] core_worker.cc:2194: Actor with class name: 'MapWorker(MapBatches(to_column00)->MapBatches(IncrementBatch))' and ID: '9f83bf903d5c378362f8d21901000000' has constructor arguments in the object store and max_restarts > 0. If the arguments in the object store go out of scope or are lost, the actor restart will fail. See https://github.com/ray-project/ray/issues/53727 for more details.
+2026-04-24 03:02:39,194	WARNING resource_manager.py:169 -- ⚠️  Ray's object store is configured to use only 2.5% of available memory (6.0GiB out of 238.1GiB total). For optimal Ray Data performance, we recommend setting the object store to at least 50% of available memory. You can do this by setting the 'object_store_memory' parameter when calling ray.init() or by setting the RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION environment variable.
+2026-04-24 03:02:39,194	WARNING __init__.py:28 -- Progress bars disabled. To enable, set `ray.data.DataContext.get_current().enable_progress_bars = True`.
+*** SIGTERM received at time=1777000946 on cpu 34 ***
+[failure_signal_handler.cc : 345] RAW: Signal 15 raised at PC=0x7dc0ea72728d while already in AbslFailureSignalHandler()
+*** SIGTERM received at time=1777000946 on cpu 34 ***
+PC: @     0x7dc0ea72728d  (unknown)  syscall
+    @     0x7dc0ea645330       3488  (unknown)
+    @     0x7dc0e8fbb018         96  UnwindImpl<>()
+    @     0x7dc0e8fbb1ae        496  absl::lts_20230802::GetStackFramesWithContext()
+    @     0x7dc0e8fa6f21         80  absl::lts_20230802::AbslFailureSignalHandler()
+    @     0x7dc0ea645330  (unknown)  (unknown)
+    @     0x7dc0ea6a42be        112  (unknown)
+    @           0x61064f         96  PyThread_acquire_lock_timed
+    @           0x64dbfa        160  (unknown)
+    @           0x5516b8         80  (unknown)
+    @           0x549cb5         32  PyObject_Vectorcall
+    @           0x5d7389        384  _PyEval_EvalFrameDefault
+    @           0x5a4741         96  (unknown)
+    @           0x64231a         32  (unknown)
+    @           0x5d80c2        384  _PyEval_EvalFrameDefault
+    @           0x5d58bb        128  PyEval_EvalCode
+    @           0x608b52         48  (unknown)
+    @           0x6b5263         80  (unknown)
+    @           0x6b4fca        128  _PyRun_SimpleFileObject
+    @           0x6b4dff         64  _PyRun_AnyFileObject
+    @           0x6bce65        288  Py_RunMain
+    @           0x6bc94d         48  Py_BytesMain
+    @     0x7dc0ea62a1ca        160  (unknown)
+    @     0x7dc0ea62a28b         96  __libc_start_main
+    @           0x657b05  (unknown)  _start
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474: *** SIGTERM received at time=1777000946 on cpu 34 ***
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474: PC: @     0x7dc0ea72728d  (unknown)  syscall
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea645330       3488  (unknown)
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0e8fbb018         96  UnwindImpl<>()
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0e8fbb1ae        496  absl::lts_20230802::GetStackFramesWithContext()
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0e8fa6f21         80  absl::lts_20230802::AbslFailureSignalHandler()
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea645330  (unknown)  (unknown)
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea6a42be        112  (unknown)
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @           0x61064f         96  PyThread_acquire_lock_timed
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @           0x64dbfa        160  (unknown)
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @           0x5516b8         80  (unknown)
+[2026-04-24 03:22:26,044 E 1047387 1047387] logging.cc:474:     @           0x549cb5         32  PyObject_Vectorcall
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x5d7389        384  _PyEval_EvalFrameDefault
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x5a4741         96  (unknown)
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x64231a         32  (unknown)
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x5d80c2        384  _PyEval_EvalFrameDefault
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x5d58bb        128  PyEval_EvalCode
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x608b52         48  (unknown)
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x6b5263         80  (unknown)
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x6b4fca        128  _PyRun_SimpleFileObject
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x6b4dff         64  _PyRun_AnyFileObject
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x6bce65        288  Py_RunMain
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x6bc94d         48  Py_BytesMain
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea62a1ca        160  (unknown)
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea62a28b         96  __libc_start_main
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474:     @           0x657b05  (unknown)  _start
+PC: @     0x7dc0ea698d71  (unknown)  (unknown)
+    @     0x7dc0ea645330  (unknown)  (unknown)
+    @     0x7dc0ea6a42be        112  (unknown)
+    @           0x61064f         96  PyThread_acquire_lock_timed
+    @           0x64dbfa        160  (unknown)
+    @           0x5516b8         80  (unknown)
+    @           0x549cb5         32  PyObject_Vectorcall
+    @           0x5d7389        384  _PyEval_EvalFrameDefault
+    @           0x5a4741         96  (unknown)
+    @           0x64231a         32  (unknown)
+    @           0x5d80c2        384  _PyEval_EvalFrameDefault
+    @           0x5d58bb        128  PyEval_EvalCode
+    @           0x608b52         48  (unknown)
+    @           0x6b5263         80  (unknown)
+    @           0x6b4fca        128  _PyRun_SimpleFileObject
+    @           0x6b4dff         64  _PyRun_AnyFileObject
+    @           0x6bce65        288  Py_RunMain
+    @           0x6bc94d         48  Py_BytesMain
+    @     0x7dc0ea62a1ca        160  (unknown)
+    @     0x7dc0ea62a28b         96  __libc_start_main
+    @           0x657b05  (unknown)  _start
+[2026-04-24 03:22:26,045 E 1047387 1047387] logging.cc:474: *** SIGTERM received at time=1777000946 on cpu 34 ***
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474: PC: @     0x7dc0ea698d71  (unknown)  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea645330  (unknown)  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea6a42be        112  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x61064f         96  PyThread_acquire_lock_timed
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x64dbfa        160  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x5516b8         80  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x549cb5         32  PyObject_Vectorcall
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x5d7389        384  _PyEval_EvalFrameDefault
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x5a4741         96  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x64231a         32  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x5d80c2        384  _PyEval_EvalFrameDefault
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x5d58bb        128  PyEval_EvalCode
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x608b52         48  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x6b5263         80  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x6b4fca        128  _PyRun_SimpleFileObject
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x6b4dff         64  _PyRun_AnyFileObject
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x6bce65        288  Py_RunMain
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x6bc94d         48  Py_BytesMain
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea62a1ca        160  (unknown)
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @     0x7dc0ea62a28b         96  __libc_start_main
+[2026-04-24 03:22:26,046 E 1047387 1047387] logging.cc:474:     @           0x657b05  (unknown)  _start
+2026-04-24 03:22:26,070	INFO streaming_executor.py:312 -- ⚠️  Dataset dataset_3_0 execution failed
+timeout: the monitored command dumped core
