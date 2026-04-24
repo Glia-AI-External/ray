@@ -493,6 +493,273 @@ def run_long_tasks(
 
 
 # ---------------------------------------------------------------------------
+# Workload 5: Actor-pool under plasma pressure
+# ---------------------------------------------------------------------------
+#
+# Exercises an actor-pool stage under a tight object-store budget. Combines:
+#   - autoscaling actor pool with large per-actor plasma objects (via ray.put
+#     inside __init__ so each actor's plasma entry is distinct),
+#   - per-task sleep that makes scheduling-step duration meaningful,
+#   - output-batch padding so pending-output plasma pressure builds up during
+#     the run,
+#   - tight `object_store_memory` + `automatic_object_spilling_enabled=False`
+#     so Ray's budget allocator is the dominant throttle rather than the
+#     spill release valve.
+#
+# This is the regime that triggered the reviewer-reported stall on a
+# 100-node / SF=1000 cluster: actor ops' `incremental_resource_usage()` is
+# all zeros, so M5's `on_task_dispatched` hook never decrements the op's
+# `object_store_memory` budget within a scheduling step. The op over-commits
+# plasma until the next `update_usages()` boundary, and if plasma has no
+# room to grow (tight /dev/shm + spilling disabled) the pipeline stalls.
+#
+# Correctness signal: the workload samples per-op `obj_store_mem_used`
+# continuously through the run and reports `peak_op_obj_store_usage_ratio`
+# = peak / budget. Pristine and M6+fix stay ≤ 1.0; buggy M5 exceeds 1.0.
+# The ratio is the stable cross-host indicator — hard stall vs "just
+# over budget" depends on /dev/shm, but the over-budget fact itself is
+# a deterministic consequence of the bug and is visible on any host.
+
+
+def run_actor_backpressure(
+    num_rows: int,
+    num_blocks: int,
+    sleep_ms: int = 50,
+    per_actor_model_bytes: int = 100 * 1024 * 1024,
+    output_padding_bytes_per_row: int = 50 * 1024,
+    concurrency_min: int = 1,
+    concurrency_max: int = 50,
+    object_store_gb: float = 6.0,
+    num_cpus: int = 32,
+    batch_size: int = 10_000,
+    sample_interval_s: float = 0.5,
+    validate: bool = False,
+    profile: bool = False,
+) -> dict:
+    """Actor-pool workload under plasma pressure; tests the M5 budget fix."""
+    import threading
+
+    import ray
+    import ray.data
+
+    # Shut down any pre-existing cluster (the driver's main() may have
+    # already called ray.init() with defaults) and re-init with the tight
+    # constraints this workload requires.
+    if ray.is_initialized():
+        ray.shutdown()
+    ray.init(
+        object_store_memory=int(object_store_gb * 1024**3),
+        num_cpus=num_cpus,
+        _system_config={
+            "automatic_object_spilling_enabled": False,
+        },
+    )
+
+    profiler = None
+    if profile:
+        import cProfile
+        profiler = cProfile.Profile()
+        profiler.enable()
+
+    class IncrementBatch:
+        """Per-actor unique plasma entry + per-batch padded output."""
+
+        def __init__(self, per_actor_model_bytes, sleep_ms, padding_bytes_per_row):
+            import numpy as _np
+            # Each actor's __init__ puts its own large object into plasma.
+            # On a single-node cluster this forces N distinct plasma
+            # entries (one per actor), matching the multi-node regime
+            # where each node's object store holds its own model copy.
+            if per_actor_model_bytes > 0:
+                self._unique = ray.put(
+                    _np.zeros(per_actor_model_bytes, dtype=_np.int8)
+                )
+                self.model = ray.get(self._unique)
+            self.sleep_ms = sleep_ms
+            self.padding_bytes_per_row = padding_bytes_per_row
+
+        def __call__(self, batch):
+            import numpy as _np
+            if self.sleep_ms > 0:
+                time.sleep(self.sleep_ms / 1000.0)
+            batch["column00"] = batch["column00"] + 1
+            if self.padding_bytes_per_row > 0:
+                n = len(batch["column00"])
+                batch["padding"] = _np.zeros(
+                    (n, self.padding_bytes_per_row), dtype=_np.int8
+                )
+            return batch
+
+    def to_column00(batch):
+        # `ray.data.range()` in numpy batch_format already yields a numpy
+        # array under `id`; rename it to match IncrementBatch's contract.
+        return {"column00": batch["id"]}
+
+    def dummy_write(batch):
+        # Return column00 (not batch size). Row content is
+        # deterministic under Ray Data's row-content guarantee; batch
+        # size is not (FIFOBundleQueue + streaming completion order can
+        # shift batch boundaries across runs with preserve_order=False).
+        # Hashing column00 lets _hash_dataset verify real correctness.
+        return {"column00": batch["column00"]}
+
+    # --- Over-allocation sampler ----------------------------------------
+    # Correctness signal: at every sample, for each op, is
+    #   _op_running_usages[op].object_store_memory <= get_allocation(op).object_store_memory ?
+    # These are the exact numbers Ray Data prints in its DEBUG progress
+    # log ("Resources: ... object store" vs "alloc=..."). The allocation
+    # INCLUDES the allocator's dynamic borrow from other ops' slack, so
+    # a ratio > 1.0 is a genuine over-commit — not legitimate borrowing.
+    # Expected: pristine and M6+AltB stay ≤ 1.0; M5/M6 without the fix
+    # can exceed 1.0 (actor op over-commits because on_task_dispatched
+    # can't see plasma).
+    sampler_state = {
+        "stop": False,
+        "peak_used_bytes": 0,
+        "peak_alloc_bytes": 0,
+        "peak_ratio": 0.0,
+        "num_samples": 0,
+    }
+
+    def sample_peak_usage():
+        while not sampler_state["stop"]:
+            try:
+                rm = sampler_state.get("resource_manager")
+                ops = sampler_state.get("ops", [])
+                if rm is not None and ops:
+                    alloc_api = rm._op_resource_allocator
+                    for op in ops:
+                        usage = rm._op_running_usages.get(op)
+                        alloc = (
+                            alloc_api.get_allocation(op)
+                            if alloc_api is not None
+                            else None
+                        )
+                        if usage is None or alloc is None:
+                            continue
+                        used = usage.object_store_memory or 0
+                        a = alloc.object_store_memory or 0
+                        if a > 0:
+                            ratio = used / a
+                            if ratio > sampler_state["peak_ratio"]:
+                                sampler_state["peak_ratio"] = ratio
+                                sampler_state["peak_used_bytes"] = used
+                                sampler_state["peak_alloc_bytes"] = a
+                    sampler_state["num_samples"] += 1
+            except Exception:
+                pass  # sampler must never crash the run
+            time.sleep(sample_interval_s)
+
+    sampler = threading.Thread(target=sample_peak_usage, daemon=True)
+    sampler.start()
+
+    cpu_w0, cpu_c0 = _driver_cpu_snapshot()
+    start = time.perf_counter()
+
+    ds = ray.data.range(num_rows, override_num_blocks=num_blocks)
+    ds = ds.map_batches(to_column00, batch_format="numpy", batch_size=batch_size)
+    ds = ds.map_batches(
+        IncrementBatch,
+        fn_constructor_args=[
+            per_actor_model_bytes, sleep_ms, output_padding_bytes_per_row
+        ],
+        batch_format="numpy",
+        batch_size=batch_size,
+        concurrency=(concurrency_min, concurrency_max),
+    )
+    ds = ds.map_batches(dummy_write, batch_format="numpy", batch_size=batch_size)
+
+    # Capture the StreamingExecutor instance via a scoped monkey-patch
+    # of its __init__. Ray Data's ExecutionPlan doesn't expose the
+    # executor as an attribute after creation, so there's no clean way
+    # to grab it from the dataset object. We install a one-shot wrapper,
+    # let iter_internal_ref_bundles create the executor, then
+    # restore the original __init__.
+    from ray.data._internal.execution.streaming_executor import (
+        StreamingExecutor as _SE,
+    )
+    _orig_init = _SE.__init__
+
+    def _capturing_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        if sampler_state.get("executor") is None:
+            sampler_state["executor"] = self
+
+    _SE.__init__ = _capturing_init
+
+    def _hook_sampler_once():
+        # Poll for the captured executor, then publish the resource
+        # manager + ops so the sampler can call get_allocation(op).
+        import time as _t
+        deadline = _t.time() + 10.0
+        while _t.time() < deadline and sampler_state.get("ops") is None:
+            _t.sleep(0.1)
+            exec_ = sampler_state.get("executor")
+            if exec_ is None or not hasattr(exec_, "_resource_manager"):
+                continue
+            try:
+                rm = exec_._resource_manager
+                sampler_state["resource_manager"] = rm
+                sampler_state["ops"] = list(rm._topology.keys())
+            except Exception:
+                pass
+
+    hook_thread = threading.Thread(target=_hook_sampler_once, daemon=True)
+    hook_thread.start()
+
+    total_rows = 0
+    for ref_bundle in ds.iter_internal_ref_bundles():
+        for _block_ref, meta in ref_bundle.blocks:
+            total_rows += meta.num_rows or 0
+
+    wall_time = time.perf_counter() - start
+    cpu_w1, cpu_c1 = _driver_cpu_snapshot()
+
+    sampler_state["stop"] = True
+    sampler.join(timeout=2.0)
+    # Restore the original StreamingExecutor.__init__ so we don't leak
+    # the monkey-patch into other workloads or subsequent runs.
+    _SE.__init__ = _orig_init
+
+    if profile:
+        profiler.disable()
+
+    driver_cpu_per_wall = (
+        (cpu_c1 - cpu_c0) / (cpu_w1 - cpu_w0) if cpu_w1 > cpu_w0 else 0.0
+    )
+
+    result = {
+        "workload": "actor_backpressure",
+        "wall_time_sec": round(wall_time, 3),
+        "num_blocks": num_blocks,
+        "num_rows": num_rows,
+        "concurrency": [concurrency_min, concurrency_max],
+        "sleep_ms": sleep_ms,
+        "per_actor_model_bytes": per_actor_model_bytes,
+        "output_padding_bytes_per_row": output_padding_bytes_per_row,
+        "object_store_gb": object_store_gb,
+        "num_cpus": num_cpus,
+        "throughput_blocks_per_sec": round(num_blocks / wall_time, 2),
+        "throughput_rows_per_sec": round(num_rows / wall_time, 2),
+        # Correctness signal: peak per-op (object_store_used / allocation).
+        # allocation is the dynamic total including borrowing; ratio > 1.0
+        # means the op genuinely over-committed plasma at some point.
+        "peak_op_obj_store_over_alloc_ratio": round(sampler_state["peak_ratio"], 4),
+        "peak_op_obj_store_used_mb": round(
+            sampler_state["peak_used_bytes"] / (1024**2), 2
+        ),
+        "peak_op_obj_store_alloc_mb": round(
+            sampler_state["peak_alloc_bytes"] / (1024**2), 2
+        ),
+        "num_sampler_reads": sampler_state["num_samples"],
+    }
+
+    _record_cpu(result, cpu_w0, cpu_c0, cpu_w1, cpu_c1)
+    _validate_and_profile(ds, result, validate, profile, profiler)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -504,7 +771,14 @@ def main():
     )
     parser.add_argument(
         "--workload",
-        choices=["synthetic", "mixed_pipeline", "medium_tasks", "long_tasks", "all"],
+        choices=[
+            "synthetic",
+            "mixed_pipeline",
+            "medium_tasks",
+            "long_tasks",
+            "actor_backpressure",
+            "all",
+        ],
         required=True,
         help="Which workload(s) to run",
     )
@@ -615,6 +889,28 @@ def main():
             profile=args.profile,
         )
         results.append(long_result)
+
+    if args.workload in ("actor_backpressure", "all"):
+        bp_config = config.get("actor_backpressure", {})
+        bp_result = run_actor_backpressure(
+            num_rows=bp_config.get("num_rows", 20_000_000),
+            num_blocks=bp_config.get("num_blocks", 5000),
+            sleep_ms=bp_config.get("sleep_ms", 50),
+            per_actor_model_bytes=bp_config.get(
+                "per_actor_model_bytes", 100 * 1024 * 1024
+            ),
+            output_padding_bytes_per_row=bp_config.get(
+                "output_padding_bytes_per_row", 50 * 1024
+            ),
+            concurrency_min=bp_config.get("concurrency_min", 1),
+            concurrency_max=bp_config.get("concurrency_max", 50),
+            object_store_gb=bp_config.get("object_store_gb", 6.0),
+            num_cpus=bp_config.get("num_cpus", 32),
+            batch_size=bp_config.get("batch_size", 10_000),
+            validate=args.validate,
+            profile=args.profile,
+        )
+        results.append(bp_result)
 
     # Compute composite score.
     #

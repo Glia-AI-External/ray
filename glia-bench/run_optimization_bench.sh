@@ -32,7 +32,7 @@ OUT="${SCRIPT_DIR}/results/optimization_perf.jsonl"
 WORKLOAD="${1:-all}"
 N_RUNS="${2:-5}"
 if [ "$WORKLOAD" = "all" ]; then
-    WORKLOADS=(synthetic mixed_pipeline medium_tasks long_tasks)
+    WORKLOADS=(synthetic mixed_pipeline medium_tasks long_tasks actor_backpressure)
 else
     WORKLOADS=("$WORKLOAD")
 fi
@@ -85,6 +85,10 @@ rec = {
     'driver_cpu_per_wall': w['driver_cpu_per_wall'],
     'efficiency_blocks_per_core_sec': w['efficiency_blocks_per_core_sec'],
     'output_hash': w['output_hash'],
+    'peak_op_obj_store_over_alloc_ratio': w.get('peak_op_obj_store_over_alloc_ratio'),
+    'peak_op_obj_store_used_mb': w.get('peak_op_obj_store_used_mb'),
+    'peak_op_obj_store_alloc_mb': w.get('peak_op_obj_store_alloc_mb'),
+    'num_sampler_reads': w.get('num_sampler_reads'),
 }
 print(json.dumps(rec))
 " >> "$OUT"
