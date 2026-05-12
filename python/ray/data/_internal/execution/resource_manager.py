@@ -266,50 +266,148 @@ class ResourceManager:
     def on_task_dispatched(self, op: "PhysicalOperator") -> None:
         """Called by the scheduler immediately after ``op`` dispatches a task.
 
-        Incrementally updates the subset of ResourceManager state that gating
-        consumers read inside the inner dispatch loop, so that decisions made
-        mid-step reflect the tasks already dispatched this step rather than
-        the last `update_usages()` snapshot. This replaces the per-dispatch
-        full `update_usages()` walk (O(topology) per dispatch) with
-        O(1) incremental updates on the dispatching op only. The next
-        `update_usages()` at the top of the next scheduling step rebuilds
-        every field from the operators themselves, so drift is bounded to
-        a single step.
+        Refreshes the ResourceManager state that the dispatch event
+        actually changed: ``op`` itself and ``op``'s upstream dependencies.
+        The cross-loop reader cohort (cluster autoscaler's
+        ``ResourceUtilizationGauge`` reads ``_global_usage``; dashboard
+        reads ``op._metrics.obj_store_mem_used``) sees fresh values
+        without waiting for the next scheduling-step ``update_usages()``.
 
-        Fields updated here — all read by gating consumers inside the inner
-        dispatch loop:
-          - ``_op_usages[op]`` and ``_op_running_usages[op]`` — read by
-            `DefaultRanker.rank_operator()` and
-            `DownstreamCapacityBackpressurePolicy._get_queue_size_bytes()`.
-          - ``_mem_op_internal[op]`` — read by
-            `ConcurrencyCapBackpressurePolicy.can_add_input()`.
-          - ``_op_budgets[op]`` (via the allocator) — read by
-            `can_submit_new_task()`.
-          - ``op._metrics.obj_store_mem_used`` — dashboard / DatasetStats
-            metric; kept consistent with ``_op_usages`` so observability
-            mirrors reality within a step.
+        Why neighbor coverage is sufficient.
+        --------------------------------------
+        A dispatch event mutates ground truth in exactly two places:
 
-        Fields intentionally NOT updated here:
-          - ``_mem_op_outputs[op]`` — its terms depend on task completion
-            and downstream pulls, not dispatch.
-          - ``_op_pending_usages[op]`` — not read by any gating consumer.
+        1.  **The dispatching op (``op``)**:
+              - ``num_tasks_running`` and ``incremental_resource_usage()``-
+                related fields grew (for task pools, by the task's
+                resources; for actor pools, by 0 since the actor
+                already holds resources).
+              - ``obj_store_mem_pending_task_outputs`` grew (the new
+                task will write predicted output bytes).
+              - ``obj_store_mem_pending_task_inputs`` grew (the new
+                task accepted input bundle bytes).
+              - ``current_logical_usage()`` may have grown for OTHER
+                reasons too (a new actor came online in an
+                ActorPoolMapOperator between scheduling-step
+                boundaries) — re-reading it picks that up too.
 
-        Global aggregates (``_global_usage``, ``_global_running_usage``)
-        are updated so progress-log lines stay consistent with the per-op
-        fields within a step; they are not themselves gating inputs.
+        2.  **Each upstream dependency of ``op``**:
+              The cross-op term in ``_estimate_object_store_memory_usage``
+              attributes ``sum(downstream.obj_store_mem_pending_task_inputs)``
+              to each upstream, modeling the bytes-in-flight that this
+              upstream's outputs have committed to. When ``op`` dispatches,
+              ``op.obj_store_mem_pending_task_inputs`` grew, so each
+              upstream's ``_mem_op_outputs`` term grew by the same amount
+              — and upstream's ``_op_usages[upstream].object_store_memory``
+              with it.
+
+        **Downstream dependencies of ``op`` are NOT affected**: ``op``'s
+        outputs flow into downstream's input queue only when a task
+        completes (in ``process_completed_tasks``), not when a task is
+        dispatched. So downstream's metrics and ``_mem_op_internal`` are
+        invariant under a dispatch event.
+
+        This is the structural justification for refreshing
+        ``{op} ∪ op.input_dependencies`` and nothing else.
+
+        Asymptotic cost.
+        ------------------
+        The pre-M5 baseline called ``update_usages()`` after every
+        dispatch — O(N_ops) work per dispatch. The pure incremental form
+        was O(1) but produced stale state at four observed sites
+        (``_global_usage``, cross-op ``_mem_op_outputs``,
+        ``_global_pending_usage``, upstream's ``obj_store_mem_used``
+        dashboard metric). This form is
+        O(1 + |op.input_dependencies|) — typically 1–2 — preserving M5's
+        asymptotic win for fan-in pipelines while restoring the
+        observability/autoscaler-feedback invariants.
+
+        For allocator state, this hook preserves M5's
+        ``OpResourceAllocator.on_task_dispatched(op, delta)`` per-op
+        budget decrement. We deliberately do NOT call the full
+        ``_update_allocated_budgets()`` redistribution — that is the
+        existing "design-intended drift" pinned by
+        ``test_m5_borrow_drift_in_multi_op_topology_is_real_and_quantified``
+        and is bounded to one scheduling step.
+
+        Fields updated for the dispatching op and each upstream:
+          - ``_op_usages[o]``, ``_op_running_usages[o]``,
+            ``_op_pending_usages[o]`` — re-read from the op's logical
+            usage methods plus the recomputed object-store-memory term.
+          - ``_mem_op_internal[o]``, ``_mem_op_outputs[o]`` — recomputed
+            as a side effect of ``_estimate_object_store_memory_usage``.
+          - ``o._metrics.obj_store_mem_used`` — dashboard / DatasetStats
+            metric.
+
+        Global aggregates updated by incremental subtract-old + add-new:
+          - ``_global_usage``, ``_global_running_usage``,
+            ``_global_pending_usage``.
+
+        Allocator hook preserved:
+          - ``_op_budgets[op]`` decrement via
+            ``OpResourceAllocator.on_task_dispatched``.
         """
-        delta = self._dispatch_delta(op)
+        # Per-op state refresh: re-read each affected op's logical usage
+        # and recompute its object-store-memory contribution. Update the
+        # globals by the actual delta from the cached value, not by a
+        # static dispatch delta (which understates growth for actor pool
+        # size changes and zeros out cross-op input-bytes growth).
+        affected_ops = [op]
+        affected_ops.extend(op.input_dependencies)
 
-        if op in self._op_usages:
-            self._op_usages[op] = self._op_usages[op].add(delta)
-            self._op_running_usages[op] = self._op_running_usages[op].add(delta)
-            self._mem_op_internal[op] += delta.object_store_memory
-            op._metrics.obj_store_mem_used = self._op_usages[op].object_store_memory
+        for affected_op in affected_ops:
+            if affected_op not in self._topology:
+                continue
+            state = self._topology[affected_op]
 
-        self._global_usage = self._global_usage.add(delta)
-        self._global_running_usage = self._global_running_usage.add(delta)
+            new_op_usage = affected_op.current_logical_usage()
+            new_op_running_usage = affected_op.running_logical_usage()
+            new_op_pending_usage = affected_op.pending_logical_usage()
 
+            used_object_store = self._estimate_object_store_memory_usage(
+                affected_op, state
+            )
+
+            new_op_usage = new_op_usage.copy(object_store_memory=used_object_store)
+            new_op_running_usage = new_op_running_usage.copy(
+                object_store_memory=used_object_store
+            )
+
+            if isinstance(affected_op, ReportsExtraResourceUsage):
+                new_op_usage = new_op_usage.add(affected_op.extra_resource_usage())
+
+            old_op_usage = self._op_usages.get(
+                affected_op, ExecutionResources.zero()
+            )
+            old_op_running_usage = self._op_running_usages.get(
+                affected_op, ExecutionResources.zero()
+            )
+            old_op_pending_usage = self._op_pending_usages.get(
+                affected_op, ExecutionResources.zero()
+            )
+
+            self._global_usage = self._global_usage.add(
+                new_op_usage.subtract(old_op_usage)
+            )
+            self._global_running_usage = self._global_running_usage.add(
+                new_op_running_usage.subtract(old_op_running_usage)
+            )
+            self._global_pending_usage = self._global_pending_usage.add(
+                new_op_pending_usage.subtract(old_op_pending_usage)
+            )
+
+            self._op_usages[affected_op] = new_op_usage
+            self._op_running_usages[affected_op] = new_op_running_usage
+            self._op_pending_usages[affected_op] = new_op_pending_usage
+
+            affected_op._metrics.obj_store_mem_used = new_op_usage.object_store_memory
+
+        # Preserve the existing M5 per-op budget decrement. The full
+        # `_update_allocated_budgets()` redistribution is deliberately
+        # NOT called here — that drift is design-intended, bounded to
+        # one scheduling step, and pinned by an existing test.
         if self._op_resource_allocator is not None:
+            delta = self._dispatch_delta(op)
             self._op_resource_allocator.on_task_dispatched(op, delta)
 
     def _dispatch_delta(self, op: "PhysicalOperator") -> ExecutionResources:

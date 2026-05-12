@@ -1429,15 +1429,31 @@ def test_on_task_dispatched_updates_op_usages_read_by_gating_consumers(
     ``update_usages()`` runs again.
 
     Invariant under test: after a dispatch, ``_op_usages[op]`` and
-    ``_op_running_usages[op]`` each advance by the same delta the
-    allocator used to decrement the budget (the sum of
-    ``incremental_resource_usage()`` and
-    ``obj_store_mem_max_pending_output_per_task``).
+    ``_op_running_usages[op]`` reflect the operator's
+    ``current_logical_usage()`` and ``running_logical_usage()`` post-
+    dispatch. The mock for those methods is wired to advance by
+    ``(cpu=2, gpu=0)`` on dispatch (simulating the new task's reserved
+    Ray-core resources), and the test then asserts the cache picked
+    that up plus the predicted plasma commitment.
     """
     input_op = InputDataBuffer(DataContext.get_current(), MagicMock())
     op2 = mock_map_op(input_op=input_op, ray_remote_args={"num_cpus": 2})
     op2.incremental_resource_usage = MagicMock(
         return_value=ExecutionResources(cpu=2, gpu=0)
+    )
+    # Model the operator's logical usage growing on dispatch. The fix's
+    # `on_task_dispatched` re-reads these methods rather than applying
+    # a static delta, so the mock must advance them to reflect the new
+    # running task.
+    state = {"running_cpu": 0.0}
+    op2.current_logical_usage = MagicMock(
+        side_effect=lambda: ExecutionResources(cpu=state["running_cpu"], gpu=0)
+    )
+    op2.running_logical_usage = MagicMock(
+        side_effect=lambda: ExecutionResources(cpu=state["running_cpu"], gpu=0)
+    )
+    op2.pending_logical_usage = MagicMock(
+        return_value=ExecutionResources.zero()
     )
     per_task_output_bytes = 50 * 1024 * 1024  # 50 MiB
 
@@ -1457,7 +1473,16 @@ def test_on_task_dispatched_updates_op_usages_read_by_gating_consumers(
     before_usage = rm._op_usages[op2]
     before_running = rm._op_running_usages[op2]
 
+    # Simulate the dispatch: one new task is now running, so the op's
+    # logical usage grows by `incremental_resource_usage()`. Also wire
+    # the per-task-output metric for plasma commitment.
+    state["running_cpu"] = 2.0
     with patch.object(
+        type(op2.metrics),
+        "obj_store_mem_pending_task_outputs",
+        new_callable=PropertyMock,
+        return_value=per_task_output_bytes,
+    ), patch.object(
         type(op2.metrics),
         "obj_store_mem_max_pending_output_per_task",
         new_callable=PropertyMock,
@@ -1508,6 +1533,15 @@ def test_on_task_dispatched_updates_mem_op_internal_and_dashboard_metric(
     op2.incremental_resource_usage = MagicMock(
         return_value=ExecutionResources(cpu=0, gpu=0)
     )
+    op2.current_logical_usage = MagicMock(
+        return_value=ExecutionResources(cpu=0, gpu=0)
+    )
+    op2.running_logical_usage = MagicMock(
+        return_value=ExecutionResources(cpu=0, gpu=0)
+    )
+    op2.pending_logical_usage = MagicMock(
+        return_value=ExecutionResources.zero()
+    )
     per_task_output_bytes = 25 * 1024 * 1024  # 25 MiB
 
     topo = build_streaming_topology(op2, ExecutionOptions())
@@ -1525,7 +1559,17 @@ def test_on_task_dispatched_updates_mem_op_internal_and_dashboard_metric(
 
     before_mem_internal = rm._mem_op_internal[op2]
 
+    # Simulate dispatch: a new task is now running, so the op's pending
+    # output bytes reflect the new task's predicted output. The fix's
+    # `on_task_dispatched` re-reads `obj_store_mem_pending_task_outputs`
+    # via `_estimate_object_store_memory_usage` rather than applying a
+    # static delta.
     with patch.object(
+        type(op2.metrics),
+        "obj_store_mem_pending_task_outputs",
+        new_callable=PropertyMock,
+        return_value=per_task_output_bytes,
+    ), patch.object(
         type(op2.metrics),
         "obj_store_mem_max_pending_output_per_task",
         new_callable=PropertyMock,
